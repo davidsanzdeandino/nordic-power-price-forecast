@@ -1,0 +1,69 @@
+# =============================================================================
+#  .gitignore - Nordic day-ahead price forecast
+# =============================================================================
+
+# --- Secretos / credenciales (NUNCA subir) ---
+.env
+.env.local
+*.key
+secrets.toml
+
+# --- Entornos virtuales ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Cache de Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Datos: se regeneran con el pipeline (python run_pipeline.py) ---
+data/raw/
+data/clean/
+data/master/
+data/plots/
+
+# Modelos entrenados: no se versionan; solo los resultados del walk-forward
+data/models/*
+!data/models/walkforward_*.csv
+data/models/*.pkl
+
+# Metadatos: solo se versionan las 8 métricas publicadas
+data/metadata/*
+!data/metadata/served_metrics_DK1.json
+!data/metadata/served_metrics_DK2.json
+!data/metadata/served_metrics_FI.json
+!data/metadata/train_DK1_20260605_145726.json
+!data/metadata/train_DK2_20260605_151856.json
+!data/metadata/train_FI_20260606_091405.json
+!data/metadata/experiment_fcr_results.json
+!data/metadata/integration_20260605_144247.json
+
+# --- Logs y ficheros temporales de ejecución ---
+*.log
+data/_*.json
+
+# --- Sistema operativo / editores ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Optuna / estudios temporales ---
+*.db-journal
+
+# --- Temporales de escritura atómica ---
+*.tmp
+*.tmp.*
+
+# --- Copias locales de regeneración ---
+_backup_pre_regen/

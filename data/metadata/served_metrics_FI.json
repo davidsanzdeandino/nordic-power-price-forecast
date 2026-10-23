@@ -1,0 +1,9 @@
+{
+  "MAE_test": 21.05,
+  "DirAcc_test": 72.95,
+  "RMSE_test": 37.625,
+  "n_test": 3624,
+  "production_model": "Diverse ensemble (L2+median+Huber) + AR",
+  "MAE_lear": 28.697,
+  "MAE_vs_lear": -7.647
+}

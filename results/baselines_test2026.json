@@ -1,0 +1,151 @@
+{
+  "description": "Day-ahead price baselines on the out-of-sample test set (January to May 2026, hourly, UTC).",
+  "source": "Comparison tables printed by src/model/baselines.py (run_all_baselines) in the run of 2026-06-10; values copied as printed.",
+  "units": {
+    "MAE": "EUR/MWh",
+    "RMSE": "EUR/MWh",
+    "sMAPE_pct": "%",
+    "DirAcc_pct": "% of hours where the sign of the hour-on-hour change is right",
+    "R2": "coefficient of determination"
+  },
+  "models": {
+    "persistence_24h": "Persistence naive: the price of the same hour on the previous day (lag 24 h).",
+    "weekly_mean_4w": "Weekly seasonal mean: average of the same hour and weekday over the previous 4 weeks.",
+    "lear": "LEAR: linear ARX model with Ridge regularisation, using the wind and temperature of its own zone (zone-aware)."
+  },
+  "notes": "rMAE_vs_persistence_24h is not printed by the run; it is derived here as MAE / MAE of persistence_24h from the same table, rounded to 3 decimals.",
+  "zones": {
+    "DK1": {
+      "test_period": {
+        "start_utc": "2026-01-01T00:00:00Z",
+        "end_utc": "2026-05-31T23:00:00Z",
+        "hours": 3624
+      },
+      "series_period": {
+        "start": "2023-01-01",
+        "end": "2026-05-31",
+        "hourly_observations": 29928
+      },
+      "baselines": {
+        "persistence_24h": {
+          "model": "Persistence_24h",
+          "n_obs": 3624,
+          "MAE": 26.693,
+          "RMSE": 38.819,
+          "sMAPE_pct": 42.346,
+          "DirAcc_pct": 78.17,
+          "R2": 0.3076,
+          "rMAE_vs_persistence_24h": 1.0
+        },
+        "weekly_mean_4w": {
+          "model": "WeeklyMean_4w",
+          "n_obs": 3624,
+          "MAE": 29.069,
+          "RMSE": 38.882,
+          "sMAPE_pct": 41.93,
+          "DirAcc_pct": 80.57,
+          "R2": 0.3053,
+          "rMAE_vs_persistence_24h": 1.089
+        },
+        "lear": {
+          "model": "LEAR",
+          "n_obs": 3624,
+          "MAE": 22.542,
+          "RMSE": 29.147,
+          "sMAPE_pct": 36.838,
+          "DirAcc_pct": 80.07,
+          "R2": 0.6096,
+          "rMAE_vs_persistence_24h": 0.844
+        }
+      }
+    },
+    "DK2": {
+      "test_period": {
+        "start_utc": "2026-01-01T00:00:00Z",
+        "end_utc": "2026-05-31T23:00:00Z",
+        "hours": 3624
+      },
+      "series_period": {
+        "start": "2023-01-01",
+        "end": "2026-05-31",
+        "hourly_observations": 29928
+      },
+      "baselines": {
+        "persistence_24h": {
+          "model": "Persistence_24h",
+          "n_obs": 3624,
+          "MAE": 30.422,
+          "RMSE": 45.653,
+          "sMAPE_pct": 45.084,
+          "DirAcc_pct": 79.57,
+          "R2": 0.2299,
+          "rMAE_vs_persistence_24h": 1.0
+        },
+        "weekly_mean_4w": {
+          "model": "WeeklyMean_4w",
+          "n_obs": 3624,
+          "MAE": 33.776,
+          "RMSE": 45.247,
+          "sMAPE_pct": 44.785,
+          "DirAcc_pct": 81.59,
+          "R2": 0.2435,
+          "rMAE_vs_persistence_24h": 1.11
+        },
+        "lear": {
+          "model": "LEAR",
+          "n_obs": 3624,
+          "MAE": 26.273,
+          "RMSE": 35.017,
+          "sMAPE_pct": 39.603,
+          "DirAcc_pct": 80.18,
+          "R2": 0.5469,
+          "rMAE_vs_persistence_24h": 0.864
+        }
+      }
+    },
+    "FI": {
+      "test_period": {
+        "start_utc": "2026-01-01T00:00:00Z",
+        "end_utc": "2026-05-31T23:00:00Z",
+        "hours": 3624
+      },
+      "series_period": {
+        "start": "2023-01-01",
+        "end": "2026-05-31",
+        "hourly_observations": 29928
+      },
+      "baselines": {
+        "persistence_24h": {
+          "model": "Persistence_24h",
+          "n_obs": 3624,
+          "MAE": 34.376,
+          "RMSE": 52.43,
+          "sMAPE_pct": 62.52,
+          "DirAcc_pct": 67.51,
+          "R2": 0.4494,
+          "rMAE_vs_persistence_24h": 1.0
+        },
+        "weekly_mean_4w": {
+          "model": "WeeklyMean_4w",
+          "n_obs": 3624,
+          "MAE": 52.071,
+          "RMSE": 69.702,
+          "sMAPE_pct": 80.414,
+          "DirAcc_pct": 67.95,
+          "R2": 0.0268,
+          "rMAE_vs_persistence_24h": 1.515
+        },
+        "lear": {
+          "model": "LEAR",
+          "n_obs": 3624,
+          "MAE": 28.697,
+          "RMSE": 42.123,
+          "sMAPE_pct": 71.263,
+          "DirAcc_pct": 70.55,
+          "R2": 0.6446,
+          "rMAE_vs_persistence_24h": 0.835
+        }
+      }
+    }
+  }
+}

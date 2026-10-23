@@ -1,0 +1,47 @@
+{
+  "script": "train_DK1",
+  "timestamp": "2026-06-05T14:57:26.601474",
+  "params": {
+    "zone": "DK1",
+    "n_trials": 100,
+    "run_optuna": true,
+    "train_end": "2025-09-30 23:00",
+    "test_start": "2026-01-01"
+  },
+  "stats": {
+    "zone": "DK1",
+    "MAE_test": 14.821,
+    "MAE_test_ar": 14.841,
+    "MAE_test_ens": 15.863,
+    "MAE_test_ens_ar": 14.335,
+    "RMSE_test": 20.195,
+    "sMAPE_test": 27.889,
+    "DirAcc_test": 82.36,
+    "R2_test": 0.8126,
+    "MAE_wf_mean": 14.495,
+    "MAE_wf_ar_mean": 14.259,
+    "coverage_80": 0.37113686534216334,
+    "coverage_50": 0.20860927152317882,
+    "n_features": 166,
+    "best_params": {
+      "learning_rate": 0.03245832654032126,
+      "num_leaves": 208,
+      "max_depth": 11,
+      "min_child_samples": 91,
+      "subsample": 0.8405166006437674,
+      "colsample_bytree": 0.6267658833443015,
+      "reg_alpha": 0.03617609691215383,
+      "reg_lambda": 0.09305580067728259
+    },
+    "top5_features": [
+      "feat_de_residual_load_fc",
+      "feat_DK2_residual_load",
+      "feat_wx_SE3_wind100m_avg",
+      "feat_de_wind_fc",
+      "feat_DK1_residual_load"
+    ],
+    "ar_order": 3,
+    "ar_phi1": 0.2873,
+    "has_ensemble": true
+  }
+}

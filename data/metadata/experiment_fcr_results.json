@@ -1,0 +1,92 @@
+[
+  {
+    "target": "FI_fcrn",
+    "n_test": 3624,
+    "test_mean_eur_mw": 8.61,
+    "mae_naive24": 3.786,
+    "mae_naive168": 3.937,
+    "mae_A_nivel": 10.697,
+    "mae_B_desviacion": 3.845,
+    "mae_C_desv_ventana_corta": 3.806,
+    "best": "C_desv_corta",
+    "best_improvement_vs_naive24_pct": -0.5,
+    "top_features_B": [
+      "y_roll7d_max",
+      "y_roll7d",
+      "fingrid_FI_wind_fc_mw",
+      "price_FI"
+    ]
+  },
+  {
+    "target": "FI_fcrd_up",
+    "n_test": 3624,
+    "test_mean_eur_mw": 4.53,
+    "mae_naive24": 3.339,
+    "mae_naive168": 3.173,
+    "mae_A_nivel": 7.113,
+    "mae_B_desviacion": 5.502,
+    "mae_C_desv_ventana_corta": 4.609,
+    "best": "C_desv_corta",
+    "best_improvement_vs_naive24_pct": -38.0,
+    "top_features_B": [
+      "y_roll7d",
+      "y_lag24",
+      "price_FI",
+      "y_roll7d_max"
+    ]
+  },
+  {
+    "target": "FI_fcrd_down",
+    "n_test": 3624,
+    "test_mean_eur_mw": 2.67,
+    "mae_naive24": 0.962,
+    "mae_naive168": 1.018,
+    "mae_A_nivel": 5.26,
+    "mae_B_desviacion": 0.985,
+    "mae_C_desv_ventana_corta": 0.965,
+    "best": "C_desv_corta",
+    "best_improvement_vs_naive24_pct": -0.4,
+    "top_features_B": [
+      "y_roll7d",
+      "y_roll7d_max",
+      "fingrid_FI_wind_fc_mw",
+      "price_FI"
+    ]
+  },
+  {
+    "target": "DK2_fcrn",
+    "n_test": 3453,
+    "test_mean_eur_mw": 23.26,
+    "mae_naive24": 8.288,
+    "mae_naive168": 9.416,
+    "mae_A_nivel": 9.459,
+    "mae_B_desviacion": 8.222,
+    "mae_C_desv_ventana_corta": 8.631,
+    "best": "B_desviacion",
+    "best_improvement_vs_naive24_pct": 0.8,
+    "top_features_B": [
+      "y_roll7d",
+      "y_lag24",
+      "y_roll7d_max",
+      "y_lag168"
+    ]
+  },
+  {
+    "target": "DK2_fcrd_up",
+    "n_test": 3453,
+    "test_mean_eur_mw": 5.42,
+    "mae_naive24": 4.323,
+    "mae_naive168": 4.94,
+    "mae_A_nivel": 4.78,
+    "mae_B_desviacion": 4.142,
+    "mae_C_desv_ventana_corta": 3.972,
+    "best": "C_desv_corta",
+    "best_improvement_vs_naive24_pct": 8.1,
+    "top_features_B": [
+      "y_lag24",
+      "y_roll7d",
+      "y_roll7d_max",
+      "y_lag48"
+    ]
+  }
+]

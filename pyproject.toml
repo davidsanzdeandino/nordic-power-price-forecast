@@ -1,0 +1,31 @@
+# Tool configuration only (the project is run as scripts, not installed as a package).
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["data", "results"]
+
+[tool.ruff.lint]
+# Correctness-oriented rules that the current code base passes as it is:
+#   E9          syntax / IO errors
+#   F           pyflakes (undefined names, F63 bad comparisons, F7 misplaced
+#               statements, F82 undefined names in __all__ / locals, ...)
+#   E711-E714   comparisons with None / True / False, "not in" / "is not"
+#   E721        type comparison with ==
+#   W605        invalid escape sequences
+#   B           flake8-bugbear (mutable defaults, loop-variable closures, ...)
+select = ["E9", "F", "E711", "E712", "E713", "E714", "E721", "W605", "B"]
+# Style findings left as they are for now (unused imports and locals, f-strings
+# without placeholders, a re-import inside a function, zip() without strict=,
+# unused loop variables, warnings without stacklevel).
+ignore = ["F401", "F541", "F811", "F841", "B007", "B028", "B905"]
+
+[tool.pytest.ini_options]
+# Only tests/ is collected: checks/*.py are manual checks that need the real
+# data/master tables and trained models, so pytest must not pick them up.
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+filterwarnings = [
+    # features.py adds columns one by one; pandas warns about fragmentation.
+    "ignore::pandas.errors.PerformanceWarning",
+]

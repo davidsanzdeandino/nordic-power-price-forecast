@@ -1,0 +1,47 @@
+{
+  "script": "train_FI",
+  "timestamp": "2026-06-06T09:14:05.509303",
+  "params": {
+    "zone": "FI",
+    "n_trials": 100,
+    "run_optuna": true,
+    "train_end": "2025-09-30 23:00",
+    "test_start": "2026-01-01"
+  },
+  "stats": {
+    "zone": "FI",
+    "MAE_test": 25.853,
+    "MAE_test_ar": 26.032,
+    "MAE_test_ens": 21.302,
+    "MAE_test_ens_ar": 19.275,
+    "RMSE_test": 38.213,
+    "sMAPE_test": 51.162,
+    "DirAcc_test": 65.53,
+    "R2_test": 0.7075,
+    "MAE_wf_mean": 22.005,
+    "MAE_wf_ar_mean": 21.707,
+    "coverage_80": 0.5499448123620309,
+    "coverage_50": 0.26572847682119205,
+    "n_features": 224,
+    "best_params": {
+      "learning_rate": 0.09872590293544499,
+      "num_leaves": 36,
+      "max_depth": 5,
+      "min_child_samples": 94,
+      "subsample": 0.7590637637326296,
+      "colsample_bytree": 0.6265655646327017,
+      "reg_alpha": 0.6722071488534517,
+      "reg_lambda": 0.33206546634581324
+    },
+    "top5_features": [
+      "feat_FI_fingrid_residual_load",
+      "feat_FI_residual_load",
+      "feat_FI_fingrid_resid_load_lag24h",
+      "feat_FI_fingrid_load_fc",
+      "feat_FI_wind_fc_change"
+    ],
+    "ar_order": 3,
+    "ar_phi1": 0.1144,
+    "has_ensemble": true
+  }
+}

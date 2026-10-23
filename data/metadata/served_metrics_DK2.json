@@ -1,0 +1,10 @@
+{
+  "MAE_test": 16.856,
+  "RMSE_test": 25.697,
+  "DirAcc_test": 81.98,
+  "R2_test": 0.756,
+  "n_test": 3624,
+  "production_model": "LightGBM + AR",
+  "MAE_lear": 26.273,
+  "MAE_vs_lear": -9.416
+}
