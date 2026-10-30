@@ -1,0 +1,39 @@
+{
+  "zone": "FI",
+  "generated_by": "scripts/evaluate_fi_regimes.py",
+  "generated_on": "2026-10-30",
+  "method": "served FI forecast (predict.served_predictions) and LEAR baseline over the test window, MAE by regime; descriptive, not used for any choice",
+  "test_window_utc": [
+    "2026-01-01",
+    "2026-05-31 23:00"
+  ],
+  "served_label": "Diverse ensemble (L2 + median + Huber)",
+  "nuclear_threshold_mw": 9780.0,
+  "nuclear_threshold_note": "75th percentile of unavail_FI_total_mw over the test hours",
+  "regimes": {
+    "Overall": {
+      "n": 3624,
+      "MAE_served": 21.4548,
+      "MAE_lear": 28.6966,
+      "MAE_served_minus_lear": -7.2418
+    },
+    "Nuclear/OL3 out (top quartile unavail)": {
+      "n": 834,
+      "MAE_served": 13.0003,
+      "MAE_lear": 28.3222,
+      "MAE_served_minus_lear": -15.3219
+    },
+    "Negative-price hours (actual < 0)": {
+      "n": 27,
+      "MAE_served": 3.3189,
+      "MAE_lear": 5.4715,
+      "MAE_served_minus_lear": -2.1525
+    },
+    "Cold hours (temp < 0 °C)": {
+      "n": 1381,
+      "MAE_served": 29.1165,
+      "MAE_lear": 32.5866,
+      "MAE_served_minus_lear": -3.4701
+    }
+  }
+}

@@ -1,4 +1,4 @@
-"""(a) Feature engineering never looks at prices less than 24 h old.
+"""(a) Feature engineering only uses what is known at the day-ahead auction.
 
 Method: build a synthetic master table with the column names the pipeline
 produces, run the real ``generate_features`` on it, then rewrite every price
@@ -6,9 +6,14 @@ produces, run the real ``generate_features`` on it, then rewrite every price
 ``t0 - 24h`` and run it again. If no feature depends on prices with a lag below
 24 h, every ``feat_*`` value up to and including ``t0`` must be unchanged.
 
-The second part checks that the columns ``train.load_and_prepare`` hands to the
+A second perturbation test rewrites realised flows and commodity closes after
+11:00 CET on D-1 and checks that no feature of delivery day D moves (they use a
+48-hour lag), and a third checks that thresholds only use training rows.
+
+The last part checks that the columns ``train.load_and_prepare`` hands to the
 model exclude the master's same-instant flags (``is_congested_*``,
-``is_negative_price_*``), raw prices and raw spreads.
+``is_negative_price_*``), raw prices and raw spreads, follow the per-zone rule
+and are filled with training medians only.
 """
 
 import numpy as np
@@ -169,7 +174,7 @@ def test_training_matrix_excludes_same_instant_columns(base_master, tmp_path, mo
     monkeypatch.setattr(train_mod, "FEATURES_PATH", path)
 
     for zone in ["DK1", "DK2", "FI"]:
-        _df, X, y, feature_cols, splits = train_mod.load_and_prepare(zone, quiet_logger)
+        _df, X, y, feature_cols, splits, fill = train_mod.load_and_prepare(zone, quiet_logger)
         assert list(X.columns) == feature_cols
         forbidden = [c for c in feature_cols
                      if c.startswith(("is_congested_", "is_negative_price_", "price_",
@@ -184,3 +189,81 @@ def test_training_matrix_excludes_same_instant_columns(base_master, tmp_path, mo
         # Splits are disjoint and ordered in time.
         assert X.index[splits["train"]].max() < X.index[splits["val"]].min()
         assert X.index[splits["val"]].max() < X.index[splits["test"]].min()
+
+
+DELIVERY_DAY = pd.Timestamp("2025-11-15", tz="Europe/Copenhagen")
+REALISED_COLS = ("flow_", "ttf_", "co2_", "gas_marginal_", "thermal_marginal_")
+
+
+def test_flows_and_commodities_after_11cet_of_d_minus_1_do_not_move_day_d(
+        base_master, tmp_path, monkeypatch, quiet_logger):
+    master = _to_master(base_master, quiet_logger)
+    ref = _run_features(master, tmp_path, "ref48", monkeypatch, quiet_logger)
+
+    known_until = (DELIVERY_DAY - pd.Timedelta(days=1) + pd.Timedelta(hours=11)).tz_convert("UTC")
+    perturbed = base_master.copy()
+    late = perturbed.index > known_until
+    cols = [c for c in perturbed.columns if c.startswith(REALISED_COLS)]
+    assert len(cols) >= 6
+    noise = np.random.default_rng(5)
+    for col in cols:
+        perturbed.loc[late, col] = perturbed.loc[late, col] * 3 + noise.normal(50, 20, late.sum())
+    out = _run_features(_to_master(perturbed, quiet_logger), tmp_path, "p48",
+                        monkeypatch, quiet_logger)
+
+    feat_cols = [c for c in ref.columns if c.startswith("feat_")]
+    day_end = (DELIVERY_DAY + pd.Timedelta(days=1)).tz_convert("UTC")
+    upto = ref.index < day_end                     # every hour up to the end of day D
+    a = ref.loc[upto, feat_cols].to_numpy(dtype=float)
+    b = out.loc[upto, feat_cols].to_numpy(dtype=float)
+    same = np.isclose(a, b, rtol=1e-9, atol=1e-9, equal_nan=True)
+    leaking = [c for c, ok in zip(feat_cols, same.all(axis=0)) if not ok]
+    assert leaking == [], f"features of day D that see data published after the auction: {leaking}"
+    # The renamed 48-hour columns exist and the next day does move.
+    for c in ("feat_ttf_lag48h", "feat_co2_lag48h", "feat_ntc_utilization_DK1DK2"):
+        assert c in ref.columns
+    later = ref.index >= day_end + pd.Timedelta(hours=24)
+    assert not np.allclose(ref.loc[later, "feat_ttf_lag48h"], out.loc[later, "feat_ttf_lag48h"])
+
+
+def test_thresholds_use_training_rows_only(base_master, tmp_path, monkeypatch, quiet_logger):
+    master = _to_master(base_master, quiet_logger)
+    ref = _run_features(master, tmp_path, "thr_ref", monkeypatch, quiet_logger)
+    perturbed = base_master.copy()
+    after = perturbed.index > pd.Timestamp(train_mod.TRAIN_END, tz="UTC")
+    for col in [c for c in perturbed.columns if c.startswith("unavail_")]:
+        perturbed.loc[after, col] *= 10.0
+    perturbed.loc[after, "forecast_DK1_Wind Onshore"] *= 10.0
+    out = _run_features(_to_master(perturbed, quiet_logger), tmp_path, "thr_p",
+                        monkeypatch, quiet_logger)
+    before = ref.index <= pd.Timestamp(train_mod.TRAIN_END, tz="UTC")
+    for col in ("feat_unavail_high", "feat_DK1_unavail_low_wind", "feat_FI_unavail_low_wind"):
+        pd.testing.assert_series_equal(ref.loc[before, col], out.loc[before, col])
+
+
+def test_feature_rule_and_train_only_fill_values(base_master, tmp_path, monkeypatch, quiet_logger):
+    from src.model.config import select_feature_cols
+    master = _to_master(base_master, quiet_logger)
+    feats = _run_features(master, tmp_path, "fill", monkeypatch, quiet_logger)
+    # NaN in a feature column: the fill value must come from training rows only.
+    col = "feat_DK1_residual_load"
+    after = feats.index > pd.Timestamp(train_mod.TRAIN_END, tz="UTC")
+    feats.loc[after, col] += 1e6                      # val/test values far away
+    hole = feats.index[after][100]
+    feats.loc[hole, col] = np.nan
+    path = tmp_path / "dataset_features.parquet"
+    feats.to_parquet(path)
+    monkeypatch.setattr(train_mod, "FEATURES_PATH", path)
+
+    _df, X, _y, cols_dk, splits, fill = train_mod.load_and_prepare("DK1", quiet_logger)
+    train_median = feats.loc[feats.index[~after], col].median()
+    assert fill[col] == pytest.approx(train_median)
+    assert X.loc[hole, col] == pytest.approx(train_median)
+
+    _df, _X, _y, cols_fi, _s, _f = train_mod.load_and_prepare("FI", quiet_logger)
+    assert cols_dk == select_feature_cols(feats.columns, "DK1")
+    fi_block = [c for c in cols_fi if c not in cols_dk]
+    assert fi_block and all(
+        c.startswith(("feat_FI_", "feat_SE1_", "feat_SE3_", "feat_SE4_", "feat_EE_",
+                      "feat_sched_net_FI_", "feat_post_ol3")) for c in fi_block)
+    assert [c for c in cols_fi if c in cols_dk] == cols_dk     # same order

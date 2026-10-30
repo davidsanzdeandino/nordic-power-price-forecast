@@ -28,22 +28,26 @@ Etapas:
   Modelo:
    14. Feature engineering -> dataset_features
    15-17. Baselines (persistencia, media semanal, LEAR zone-aware) DK1/DK2/FI
-   18-20. Entrenamiento DK1/DK2/FI (LightGBM + Optuna + Quantile + Conformal + AR + Ensemble)
-   21-23. Evaluación DK1/DK2/FI
+   18-20. Entrenamiento DK1/DK2/FI con los hiperparámetros congelados de
+          src/model/best_params.json: elección LightGBM/ensemble, AR day-ahead
+          y conformal en validación (oct-dic 2025), cuantiles, walk-forward
+          -> results/training_<zona>.json
+   21-23. Evaluación en el test DK1/DK2/FI -> results/evaluation_test2026_<zona>.json
    24-26. Verificación de predicción day-ahead (smoke test) DK1/DK2/FI
   Métricas del modelo servido:
-   27-28. DK1/DK2 (scripts/gen_served_metrics.py)
-   29. FI (scripts/evaluate_fi_regimes.py)
-       -> data/metadata/served_metrics_<zona>.json
+   27-29. DK1/DK2/FI (scripts/gen_served_metrics.py)
+          -> data/metadata/served_metrics_<zona>.json
+   30. Regímenes de FI (scripts/evaluate_fi_regimes.py)
+          -> results/fi_regimes_test2026.json
 
 NOTA: los pasos de entrenamiento (train_zone) producen internamente los
 modelos quantile, el calibrador conformal, el corrector AR y el ensemble.
-No son pasos separados del pipeline. Los pasos 27-29 lanzan un script de
+No son pasos separados del pipeline. Los pasos 27-30 lanzan un script de
 scripts/ en un subproceso (función None en STEPS).
 
 Uso:
-  python run_pipeline.py                 # Pipeline completo (con Optuna, lento)
-  python run_pipeline.py --fast          # Entrena sin Optuna (mucho más rápido)
+  python run_pipeline.py                 # Pipeline completo (parámetros congelados)
+  python run_pipeline.py --optuna        # Vuelve a buscar hiperparámetros con Optuna (lento)
   python run_pipeline.py --step 3        # Solo el paso 3
   python run_pipeline.py --from 14       # Desde feature engineering en adelante
   python run_pipeline.py --from 14 --until 20
@@ -168,9 +172,9 @@ STEPS = [
     (15, "Baselines (persistencia, media semanal, LEAR) DK1", "src/model/baselines.py",                 "run_all_baselines",   {"zone": "DK1"},   "DK1"),
     (16, "Baselines (persistencia, media semanal, LEAR) DK2", "src/model/baselines.py",                 "run_all_baselines",   {"zone": "DK2"},   "DK2"),
     (17, "Baselines (persistencia, media semanal, LEAR) FI",  "src/model/baselines.py",                 "run_all_baselines",   {"zone": "FI"},    "FI"),
-    (18, "Entrenamiento DK1 (LGBM+Optuna+Quantile+Conformal+AR+Ensemble)", "src/model/train.py",        "train_zone",          {"zone": "DK1"},   "DK1"),
-    (19, "Entrenamiento DK2 (LGBM+Optuna+Quantile+Conformal+AR+Ensemble)", "src/model/train.py",        "train_zone",          {"zone": "DK2"},   "DK2"),
-    (20, "Entrenamiento FI (LGBM+Optuna+Quantile+Conformal+AR+Ensemble)",  "src/model/train.py",        "train_zone",          {"zone": "FI"},    "FI"),
+    (18, "Entrenamiento DK1 (elección, AR y conformal en validación)", "src/model/train.py",            "train_zone",          {"zone": "DK1"},   "DK1"),
+    (19, "Entrenamiento DK2 (elección, AR y conformal en validación)", "src/model/train.py",            "train_zone",          {"zone": "DK2"},   "DK2"),
+    (20, "Entrenamiento FI (elección, AR y conformal en validación)",  "src/model/train.py",            "train_zone",          {"zone": "FI"},    "FI"),
     (21, "Evaluación completa DK1",                           "src/model/evaluate.py",                  "evaluate_zone",       {"zone": "DK1"},   "DK1"),
     (22, "Evaluación completa DK2",                           "src/model/evaluate.py",                  "evaluate_zone",       {"zone": "DK2"},   "DK2"),
     (23, "Evaluación completa FI",                            "src/model/evaluate.py",                  "evaluate_zone",       {"zone": "FI"},    "FI"),
@@ -182,7 +186,8 @@ STEPS = [
     # dashboard). Se lanzan como script en un subproceso (función None).
     (27, "Métricas del modelo servido DK1",                   "scripts/gen_served_metrics.py",          None,                  {"argv": ["DK1"]}, "DK1"),
     (28, "Métricas del modelo servido DK2",                   "scripts/gen_served_metrics.py",          None,                  {"argv": ["DK2"]}, "DK2"),
-    (29, "Métricas del modelo servido FI (por régimen)",      "scripts/evaluate_fi_regimes.py",         None,                  {},                "FI"),
+    (29, "Métricas del modelo servido FI",                    "scripts/gen_served_metrics.py",          None,                  {"argv": ["FI"]},  "FI"),
+    (30, "Regímenes del modelo servido FI",                   "scripts/evaluate_fi_regimes.py",         None,                  {},                "FI"),
 ]
 
 
@@ -193,13 +198,16 @@ def main():
     parser.add_argument("--until", type=int, help="Ejecutar hasta el paso N (inclusive)")
     parser.add_argument("--zone",  choices=["DK1", "DK2", "FI"],
                         help="Limita los pasos específicos de zona a la indicada")
+    parser.add_argument("--optuna", action="store_true",
+                        help="Vuelve a buscar hiperparámetros con Optuna (lento); "
+                             "por defecto se usan los de src/model/best_params.json")
     parser.add_argument("--fast",  action="store_true",
-                        help="Entrena sin Optuna (mucho más rápido, para demos)")
+                        help="Compatibilidad: sin Optuna, que ya es el comportamiento por defecto")
     args = parser.parse_args()
 
     print(f"\nPIPELINE NORDIC DAY-AHEAD PRICE FORECAST — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    if args.fast:
-        print("   Modo --fast: entrenamiento sin Optuna")
+    if args.optuna and not args.fast:
+        print("   Modo --optuna: búsqueda de hiperparámetros con Optuna")
 
     steps_to_run = list(STEPS)
     if args.step:
@@ -215,10 +223,10 @@ def main():
     results = []
     t_total = time.time()
     for step_num, name, module_path, func_name, kwargs, zone in steps_to_run:
-        # En modo rápido, desactivar Optuna en los pasos de entrenamiento
+        # Optuna solo con --optuna (y nunca con --fast)
         run_kwargs = dict(kwargs)
-        if args.fast and func_name == "train_zone":
-            run_kwargs["run_optuna"] = False
+        if func_name == "train_zone":
+            run_kwargs["run_optuna"] = bool(args.optuna and not args.fast)
         if func_name is None:
             # Pasos de métricas servidas: sin modelo, data_loader cae al modo
             # demo y se escribirían métricas simuladas en served_metrics_*.json.

@@ -20,11 +20,14 @@ Modos de operación:
      Esto es lo que da la mejora máxima y es el escenario realista
      para near-real-time o intraday corrections.
 
-  B. DAY-AHEAD (producción):
-     A las 12:00 del día D se predicen las 24h del día D+1.
-     No se conocen los residuos de D+1. Pero sí se conocen hasta la
-     hora actual del día D. El último residuo conocido se propaga
-     con decaimiento AR a las 24-36h futuras.
+  B. DAY-AHEAD (producción y métricas servidas):
+     La subasta del día de entrega D (día local de Europe/Copenhagen)
+     cierra a las 12:00 de D-1. En ese momento se conocen los precios de
+     todas las horas de D-1 (se casaron en la subasta de D-2), así que el
+     último residuo conocido es el de las 23:00 locales de D-1. Ese
+     residuo (y los `order` anteriores) se propaga con decaimiento AR a
+     las 23-25 horas de D. Lo implementa day_ahead_offsets(), que es la
+     única función que usan predict.py, evaluate.py y train.py.
 
   C. ONLINE ROLLING (intraday updates):
      Conforme avanza el día D+1 y se conocen precios reales,
@@ -58,6 +61,11 @@ import pickle
 import warnings
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
+
+try:
+    from src.model.config import DELIVERY_TZ
+except ImportError:          # ejecución directa del módulo
+    DELIVERY_TZ = "Europe/Copenhagen"
 
 
 class ARResidualCorrector:
@@ -280,12 +288,12 @@ class ARResidualCorrector:
     def correct_offline(self, y_true: np.ndarray, y_pred: np.ndarray
                         ) -> np.ndarray:
         """
-        Corrección secuencial offline — para evaluación y backtest.
+        Corrección secuencial offline (intradía).
 
-        En cada hora t, usa el residuo REAL de t-1 (porque y_true es conocido)
-        para corregir la predicción de t. Este es el modo que da la mejora
-        máxima y es el escenario realista para intraday corrections donde
-        los precios spot se publican hora a hora.
+        En cada hora t, usa el residuo REAL de t-1 para corregir la
+        predicción de t. Usa residuos intradía, que no se conocen en la
+        subasta day-ahead: nunca para métricas day-ahead (para eso,
+        day_ahead_offsets / simulate_day_ahead_correction con index).
 
         Args:
             y_true: Valores reales (array 1D temporal)
@@ -695,63 +703,152 @@ def evaluate_ar_correction(y_true: np.ndarray, y_pred: np.ndarray,
     return corrector, metrics
 
 
+def day_ahead_offsets(index_utc,
+                      known_residuals: pd.Series,
+                      corrector: ARResidualCorrector,
+                      tz: str = DELIVERY_TZ,
+                      warn: bool = True) -> np.ndarray:
+    """
+    Corrección AR day-ahead por día de entrega local.
+
+    Para cada día de entrega D (día local de `tz`) de las horas pedidas:
+      - cutoff = 00:00 local de D, en UTC.
+      - Se toman los últimos `order` residuos con índice < cutoff. El último
+        tiene que ser el de las 23:00 locales de D-1 y los `order` tienen que
+        ser horas contiguas; si no, el offset de D es 0 (y se avisa).
+      - path = corrector.correct_day_ahead(zeros(n_pasos), residuos), donde el
+        paso de cada hora es el número de horas desde el cutoff (los días de
+        23 y 25 horas del cambio de hora salen bien).
+    Ningún residuo de D (ni posterior) entra en el offset de D, aunque esté
+    en known_residuals.
+
+    Args:
+        index_utc:       horas a corregir (DatetimeIndex tz-aware).
+        known_residuals: residuos (real - predicción) con índice horario
+                         tz-aware; puede contener horas del propio rango.
+        corrector:       ARResidualCorrector ajustado.
+        tz:              zona horaria de los días de entrega.
+        warn:            avisar de los días sin residuos válidos.
+
+    Returns:
+        np.ndarray con el offset de cada hora de index_utc (mismo orden).
+    """
+    corrector._check_fitted()
+    idx = pd.DatetimeIndex(index_utc)
+    if idx.tz is None:
+        raise ValueError("index_utc must be tz-aware")
+    idx = idx.tz_convert("UTC")
+    order = int(corrector.best_order)
+    one_h = pd.Timedelta(hours=1)
+
+    resid = pd.Series(known_residuals, dtype=float).dropna()
+    r_index = pd.DatetimeIndex(resid.index)
+    if len(r_index) and r_index.tz is None:
+        raise ValueError("known_residuals must have a tz-aware index")
+    if len(r_index):
+        resid.index = r_index.tz_convert("UTC")
+    resid = resid[~resid.index.duplicated(keep="last")].sort_index()
+    r_idx = pd.DatetimeIndex(resid.index)
+    r_val = resid.to_numpy()
+
+    offsets = np.zeros(len(idx), dtype=float)
+    days_local = idx.tz_convert(tz).normalize()
+    skipped = []
+    for day in days_local.unique():
+        cutoff = day.tz_convert("UTC")
+        pos = np.flatnonzero(days_local == day)
+        end = int(r_idx.searchsorted(cutoff, side="left"))   # residuos < cutoff
+        start = max(0, end - order)
+        prev_idx = r_idx[start:end]
+        ok = (len(prev_idx) == order
+              and prev_idx[-1] == cutoff - one_h
+              and bool(np.all(np.diff(prev_idx.asi8) == one_h.value)))
+        if not ok:
+            skipped.append(day.date())
+            continue
+        steps = np.asarray((idx[pos] - cutoff) // one_h, dtype=int)
+        path = corrector.correct_day_ahead(np.zeros(int(steps.max()) + 1),
+                                           r_val[start:end])
+        offsets[pos] = path[steps]
+
+    if skipped and warn:
+        warnings.warn(
+            f"AR day-ahead: {len(skipped)} delivery day(s) without the {order} "
+            f"contiguous residuals up to 23:00 of the previous day; offset 0 "
+            f"(first: {skipped[0]})",
+            stacklevel=2,
+        )
+    return offsets
+
+
 def simulate_day_ahead_correction(y_true: np.ndarray,
                                   y_pred: np.ndarray,
                                   corrector: ARResidualCorrector,
+                                  index=None,
                                   verbose: bool = True
                                   ) -> Dict:
     """
-    Simula la corrección day-ahead: predice 24h a la vez,
-    usando solo el último residuo conocido del día anterior.
+    Simula la corrección day-ahead sobre una serie de predicciones.
 
-    Esto es más realista que offline (no usa residuos intraday)
-    pero menos potente. Muestra el beneficio mínimo garantizado.
+    Con `index` (DatetimeIndex tz-aware de y_true): offsets por día de
+    entrega local con day_ahead_offsets, usando solo residuos de días de
+    entrega anteriores. Se excluye el primer día local (sin residuos
+    previos dentro de la serie).
 
-    Args:
-        y_true:    Valores reales (múltiplo de 24h idealmente)
-        y_pred:    Predicciones sin corregir
-        corrector: Corrector AR ajustado
+    Sin `index` (obsoleto, solo para tests sintéticos): bloques de 24 filas
+    con los residuos del bloque anterior.
 
     Returns:
-        Dict con métricas day-ahead
+        Dict con MAE/RMSE en bruto y corregidos sobre las horas puntuadas,
+        n_scored, la serie corregida ('corrected') y la máscara ('scored').
     """
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
     n = len(y_true)
-    order = corrector.best_order
-    corrected = y_pred.copy()
-
-    # Procesar día a día (bloques de 24h)
     residuals = y_true - y_pred
-    n_days = n // 24
 
-    for d in range(1, n_days):
-        start_h = d * 24
-        end_h = min(start_h + 24, n)
-
-        # Últimos residuos conocidos: fin del día anterior
-        last_resids = residuals[max(0, start_h - order): start_h]
-        if len(last_resids) < order:
-            last_resids = np.pad(last_resids, (order - len(last_resids), 0))
-
-        # Corregir las 24h del día
-        corrected[start_h:end_h] = corrector.correct_day_ahead(
-            y_pred[start_h:end_h],
-            last_resids
+    if index is not None:
+        idx = pd.DatetimeIndex(index)
+        offsets = day_ahead_offsets(idx, pd.Series(residuals, index=idx),
+                                    corrector, warn=False)
+        corrected = y_pred + offsets
+        days = idx.tz_convert(DELIVERY_TZ).normalize()
+        scored = np.asarray(days != days[0]) if n else np.zeros(0, dtype=bool)
+        n_days = int(days.nunique())
+    else:
+        warnings.warn(
+            "simulate_day_ahead_correction without index uses 24-row blocks, "
+            "not delivery days; pass index for day-ahead metrics",
+            DeprecationWarning, stacklevel=2,
         )
+        order = corrector.best_order
+        corrected = y_pred.copy()
+        n_days = n // 24
+        for d in range(1, n_days):
+            start_h = d * 24
+            end_h = min(start_h + 24, n)
+            last_resids = residuals[max(0, start_h - order): start_h]
+            if len(last_resids) < order:
+                last_resids = np.pad(last_resids, (order - len(last_resids), 0))
+            corrected[start_h:end_h] = corrector.correct_day_ahead(
+                y_pred[start_h:end_h], last_resids
+            )
+        scored = np.zeros(n, dtype=bool)
+        scored[24:] = True
 
-    errors_raw = np.abs(y_true - y_pred)
-    errors_cor = np.abs(y_true - corrected)
-
-    # Excluir primer día (sin residuos previos)
-    errors_raw = errors_raw[24:]
-    errors_cor = errors_cor[24:]
-
+    e_raw = (y_true - y_pred)[scored]
+    e_cor = (y_true - corrected)[scored]
+    mae_raw = float(np.mean(np.abs(e_raw)))
+    mae_cor = float(np.mean(np.abs(e_cor)))
     metrics = {
-        "MAE_raw": float(np.mean(errors_raw)),
-        "MAE_day_ahead_corrected": float(np.mean(errors_cor)),
-        "improvement_pct": float(
-            (np.mean(errors_raw) - np.mean(errors_cor))
-            / np.mean(errors_raw) * 100
-        ),
+        "MAE_raw": mae_raw,
+        "MAE_day_ahead_corrected": mae_cor,
+        "RMSE_raw": float(np.sqrt(np.mean(e_raw ** 2))),
+        "RMSE_day_ahead_corrected": float(np.sqrt(np.mean(e_cor ** 2))),
+        "improvement_pct": float((mae_raw - mae_cor) / mae_raw * 100),
+        "n_scored": int(scored.sum()),
+        "corrected": corrected,
+        "scored": scored,
     }
 
     if verbose:
@@ -799,8 +896,9 @@ def _run_tests():
     print(f"     φ₁ estimado: {corrector.ar_coefs[0]:.4f} (real: {true_phi})")
     print(f"     Mejora MAE:  {metrics['MAE_improvement_pct']:.1f}%")
 
-    # Test day-ahead
-    da_metrics = simulate_day_ahead_correction(y_true, y_pred, corrector)
+    # Test day-ahead (por día de entrega local)
+    idx = pd.date_range("2025-01-01", periods=n, freq="h", tz="UTC")
+    da_metrics = simulate_day_ahead_correction(y_true, y_pred, corrector, index=idx)
     assert da_metrics["improvement_pct"] > 5, "Day-ahead debería mejorar >5%"
     print(f"     Day-ahead:   {da_metrics['improvement_pct']:.1f}% mejora")
 

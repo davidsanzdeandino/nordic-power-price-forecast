@@ -70,8 +70,8 @@ if section == "Pipeline Overview":
 
     st.code("""
 # Full pipeline (run once; ENTSO-E and Fingrid need free API keys in .env)
-python run_pipeline.py                 # Runs all 29 steps (DK1, DK2, FI)
-python run_pipeline.py --fast          # Same, but trains without Optuna (faster demo)
+python run_pipeline.py                 # Runs all 30 steps (DK1, DK2, FI), frozen hyperparameters
+python run_pipeline.py --optuna        # Same, but searches the hyperparameters again with Optuna (slow)
 python run_pipeline.py --step 3        # Runs a single step
 python run_pipeline.py --from 14       # From feature engineering onwards
 python run_pipeline.py --from 14 --until 20
@@ -102,9 +102,9 @@ streamlit run app.py                   # Launch dashboard (DK/FI toggle)
     | 15 | Baselines (persistence, weekly mean, LEAR) DK1 | `src/model/baselines.py` |
     | 16 | Baselines (persistence, weekly mean, LEAR) DK2 | `src/model/baselines.py` |
     | 17 | Baselines (persistence, weekly mean, LEAR) FI | `src/model/baselines.py` |
-    | 18 | Training DK1 (LightGBM + Optuna + quantiles + conformal + AR + ensemble) | `src/model/train.py` |
-    | 19 | Training DK2 (LightGBM + Optuna + quantiles + conformal + AR + ensemble) | `src/model/train.py` |
-    | 20 | Training FI (LightGBM + Optuna + quantiles + conformal + AR + ensemble) | `src/model/train.py` |
+    | 18 | Training DK1 (model choice, AR and conformal on the validation quarter) | `src/model/train.py` |
+    | 19 | Training DK2 (model choice, AR and conformal on the validation quarter) | `src/model/train.py` |
+    | 20 | Training FI (model choice, AR and conformal on the validation quarter) | `src/model/train.py` |
     | 21 | Full evaluation DK1 | `src/model/evaluate.py` |
     | 22 | Full evaluation DK2 | `src/model/evaluate.py` |
     | 23 | Full evaluation FI | `src/model/evaluate.py` |
@@ -113,11 +113,12 @@ streamlit run app.py                   # Launch dashboard (DK/FI toggle)
     | 26 | Day-ahead prediction check FI | `src/model/predict.py` |
     | 27 | Served-model metrics DK1 | `scripts/gen_served_metrics.py` |
     | 28 | Served-model metrics DK2 | `scripts/gen_served_metrics.py` |
-    | 29 | Served-model metrics FI (by regime) | `scripts/evaluate_fi_regimes.py` |
+    | 29 | Served-model metrics FI | `scripts/gen_served_metrics.py` |
+    | 30 | FI served model by price regime | `scripts/evaluate_fi_regimes.py` |
 
     Steps 27-29 write `data/metadata/served_metrics_<zone>.json`, the figures the
-    dashboard shows. They are skipped if the features dataset or the zone's
-    trained model is missing.
+    dashboard shows, and step 30 writes `results/fi_regimes_test2026.json`. They
+    are skipped if the features dataset or the zone's trained model is missing.
     """)
 
     st.markdown("""
@@ -322,7 +323,8 @@ params_to_tune = {
     "reg_alpha":          (1e-3, 10, log=True),
     "reg_lambda":         (1e-3, 10, log=True),
 }
-# 100 trials, TPE sampler, MAE objective
+# 100 trials, TPE sampler, validation MAE objective;
+# the chosen sets are frozen in src/model/best_params.json
         """, language="python")
 
     with col2:
@@ -331,13 +333,17 @@ params_to_tune = {
         ```
         ──────────────────────────────────────────────────
         Jan 2023 ───────────────── Sep 2025   (Train)
-                              Oct ── Dec 2025   (Val → Optuna)
+                              Oct ── Dec 2025   (Val)
                                       Jan ── May 2026   (Test)
         ──────────────────────────────────────────────────
         ```
         **No random split** — strict temporal order to avoid data leakage.
-        Final model trained on Train+Val before the out-of-sample test evaluation.
-        A separate **walk-forward** loop (from mid-2024) re-tests month by month.
+        The served models are trained on Train only. The validation quarter is
+        used for early stopping, the choice between LightGBM and the ensemble
+        (Diebold-Mariano with HAC variance), the day-ahead AR term and the
+        interval calibration. The test window is only scored.
+        A separate **walk-forward** loop of a LightGBM (from mid-2024) re-tests
+        month by month.
         """)
 
         st.markdown("### Probabilistic output")
@@ -352,10 +358,13 @@ params_to_tune = {
         | P75   | 75th pct | Upper IQR (50% band) |
         | P90   | 90th pct | Upper bound (80% band) |
 
-        Raw quantile bands are under-confident, so they are **recalibrated with
-        Adaptive Conformal Inference (ACI, Gibbs & Candès 2021)**: the band width
-        adapts online to recent errors, lifting empirical coverage from ~40% to the
-        target ~80%. Verified **out-of-sample** on the test set.
+        Raw quantile bands are too narrow (on validation they cover 74.7%, 69.2%
+        and 77.5% for a nominal 80%). A split-conformal calibration
+        fitted on the validation quarter widens them, and **Adaptive Conformal
+        Inference (ACI, Gibbs & Candès 2021)** with a daily update (each day only
+        uses errors up to the previous day) adapts the width to recent errors.
+        The five served quantiles are sorted in each hour after the conformal step.
+        Coverage is measured on the whole test window.
         """)
 
     st.markdown("### How this maps to a production trading/EMS stack")
@@ -390,10 +399,11 @@ elif section == "Evaluation":
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("MAE",          f"{mae:.2f} €/MWh" if isinstance(mae, float) else mae,
-              delta="Out-of-sample, no leakage", delta_color="off",
-              help="Mean Absolute Error on the unseen 2026 test set. These are real, "
-                   "leakage-free results on public data — higher than the optimistic "
-                   "figures often quoted in EPF papers, and intentionally so.")
+              delta="Out-of-sample (see README, Limitations)", delta_color="off",
+              help="Mean Absolute Error on the January–May 2026 test window. The served "
+                   "model was fitted on train and chosen on validation, but an earlier "
+                   "version was scored on this window and some inputs have no stored "
+                   "publication time (README, Limitations).")
     c2.metric("Direction Acc.", f"{dir_acc:.1f}%" if isinstance(dir_acc, float) else dir_acc,
               delta="Random: 50%", delta_color="off",
               help="Share of hours where the model gets the direction of the price "
@@ -403,23 +413,11 @@ elif section == "Evaluation":
 
     st.markdown("### Comparison vs baselines")
     st.caption(
-        "The **measured** metrics for this model are the KPIs shown above (loaded from "
-        "`data/metadata/`) and the monthly walk-forward chart below. The table here is a "
-        "**reference of typical orders of magnitude in the Nord Pool EPF literature**, "
-        "for context only — these are *not* this project's results."
+        "Measured on the January–May 2026 test window (DK1 / DK2 / FI, MAE in €/MWh): "
+        "served ensemble 15.93 / 18.92 / 21.45, LEAR-style 22.54 / 26.27 / 28.70, "
+        "weekly mean 29.07 / 33.78 / 52.07, 24-hour persistence 26.69 / 30.42 / 34.38 "
+        "(`results/baselines_test2026.json`, `data/metadata/served_metrics_<zone>.json`)."
     )
-    st.markdown("""
-    | Model (literature reference) | MAE (€/MWh) | RMSE | sMAPE | Dir. Acc. | R² |
-    |-------|------------|------|-------|-----------|-----|
-    | Gradient boosting (LightGBM/XGBoost) | 6–9 | 9–13 | 7–10% | 58–63% | 0.70–0.80 |
-    | LEAR (Linear ARX) | 9–12 | 13–16 | 10–13% | 55–60% | 0.60–0.70 |
-    | Weekly Mean (4w) | 13–15 | 19–22 | 14–17% | ~54% | 0.40–0.45 |
-    | Persistence (24h) | 15–18 | 22–25 | 17–20% | ~50% | 0.25–0.35 |
-
-    *Ranges from EPF literature (e.g. Lago et al., 2021) and typical Nord Pool results.
-    Run `python src/model/baselines.py` and `evaluate.py` to produce this project's own
-    baseline comparison on the downloaded data.*
-    """)
 
     st.markdown("### Walk-forward validation")
     fig_wf = chart_walkforward(df_wf, zone=zone)
@@ -429,8 +427,8 @@ elif section == "Evaluation":
     st.markdown("### Known limitations")
     st.warning("""
     1. **Black swan events**: The model does not predict unprecedented events (grid failures, sudden fuel supply shocks).
-    2. **Winter peak accuracy**: MAE is ~25% higher in Dec–Feb due to higher price volatility.
-    3. **Monthly retraining required**: Market structure changes (new capacity, new interconnectors) degrade the model over time.
+    2. **Season**: on the test window the MAE in January–February was 13.7 (DK1), 21.5 (DK2) and 28.4 (FI) against 17.3, 17.2 and 17.0 in March–May (`results/evaluation_test2026_<zone>.json`, `error_stats.season_mae`).
+    3. **No retraining in the test window**: the served models are fitted up to September 2025; market changes (new capacity, new interconnectors) can degrade them over time. Only the separate walk-forward LightGBM is retrained monthly.
     4. **2022 crisis not in training**: The model may underestimate extreme spikes if a similar gas crisis recurs.
     """)
 
@@ -453,7 +451,7 @@ elif section == "Decisions Register":
         | DT-01 | 2023–2026 training period | 2020-2026 | 2022 gas crisis distorts patterns |
         | DT-02 | Hourly granularity | 15-min | ENTSO-E 15-min only from 2025 → aggregated |
         | DT-04 | Keep negative prices (flagged) | Remove outliers | Negative prices are signal, not noise |
-        | DT-05 | Interpolate gaps ≤6h | Drop NaN rows | Preserve temporal continuity |
+        | DT-05 | Fill the first 6h of each gap | Drop NaN rows | Preserve temporal continuity |
         | DT-06 | Parquet format | CSV | 5-10× compression, preserves types |
         | DT-08 | UTC everywhere | Local timezone | Avoids DST ambiguity in merge |
         | DT-11 | wind_speed_100m | wind_speed_10m | Turbine hub height ~100–150m |

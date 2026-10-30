@@ -85,9 +85,10 @@ fa1.markdown("### Forecast vs Actual")
 with fa2.popover("About the confidence bands"):
     st.markdown(
         "The solid line is the **point forecast**. The shaded area is the "
-        "**P10–P90 band** — an 80% prediction interval estimated by **quantile "
-        "regression** and re-calibrated with **conformal prediction**, so the actual "
-        "price should fall inside it ~80% of the time.\n\n"
+        "**P10–P90 band** — a nominal 80% prediction interval estimated by **quantile "
+        "regression**, re-calibrated with **conformal prediction** and sorted in each "
+        "hour. On the January–May 2026 test it held 62.7% (DK1), 60.8% (DK2) and "
+        "81.5% (FI) of hours.\n\n"
         "A **wider band** means the model is less certain (typically around spikes "
         "and high-volatility hours). Toggle the band in the sidebar."
     )

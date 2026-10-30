@@ -1,10 +1,10 @@
 {
   "description": "Battery Lab (pages/5_Battery_Lab.py), Finland: day-ahead arbitrage co-optimised with FCR-N and FCR-D up/down as a daily linear program (src/model/revenue_stacking.py), settled against realised Fingrid reserve prices.",
   "units": "thousand EUR per MW per year (annualised), gross revenue unless the key says net; cycles_per_day are day-ahead cycles",
-  "run": "2026-10-23, on the master table and the trained FI models produced by run_pipeline.py (Python 3.11.5, versions in requirements.txt), after the fix of the daily linear program described under method",
+  "run": "yearly_perfect_foresight_ceiling: checks/test_revenue_stacking.py, run 2026-10-23 and re-run 2026-10-29 with identical output (it uses the actual day-ahead price, not the forecast). test_window_2026: checks/test_battery_lab_data.py --write, run 2026-10-29 on the served FI forecast of the models trained that day and re-run 2026-10-30 after the per-hour sorting of the quantile bands, with identical output (Python 3.11.5, versions in requirements.txt)",
   "method": "Daily linear program in src/model/revenue_stacking.py. The round-trip efficiency is applied once: the square root of the round-trip efficiency on charge and on discharge in the state-of-charge balance, and day-ahead discharge settled at price times energy sold. Charge plus discharge is at most the power rating in every hour. Figures published before 2026-10-23 applied the round-trip efficiency a second time to the day-ahead leg and understated day-ahead revenue.",
   "yearly_perfect_foresight_ceiling": {
-    "source": "output of checks/test_revenue_stacking.py (yearly_stack_summary, mode oracle with the actual day-ahead price as forecast, so both day-ahead and reserve prices are known; 2026 covers January to May, annualised)",
+    "source": "written by checks/test_revenue_stacking.py --write (yearly_stack_summary, mode oracle with the actual day-ahead price as forecast, so both day-ahead and reserve prices are known; 2026 covers January to May, annualised)",
     "battery": "generic_fi_2h: Generic LFP 1 MW / 2 MWh, round-trip efficiency 0.88 (src/model/battery_specs.py)",
     "full_stack": {
       "2023": {
@@ -60,7 +60,7 @@
     }
   },
   "test_window_2026": {
-    "source": "same computation as checks/test_battery_lab_data.py (stacking_backtest on the served FI test predictions), run for both battery specs below",
+    "source": "checks/test_battery_lab_data.py --write (stacking_backtest on the served FI test forecast from predict.served_predictions), both battery specs below",
     "period": {
       "start_utc": "2026-01-01 00:00:00+00:00",
       "end_utc": "2026-05-31 23:00:00+00:00",
@@ -77,30 +77,30 @@
         "energy_mwh": 2.0,
         "round_trip_efficiency": 0.88,
         "oracle": {
-          "rev_da": 24.5,
-          "rev_fcrn": 11.0,
-          "rev_fcrd": 45.8,
-          "gross": 81.2,
-          "net": 51.0,
-          "cycles_per_day": 0.69
+          "rev_da": 24.8,
+          "rev_fcrn": 10.9,
+          "rev_fcrd": 45.6,
+          "gross": 81.4,
+          "net": 51.1,
+          "cycles_per_day": 0.7
         },
         "causal": {
-          "rev_da": 34.0,
-          "rev_fcrn": 3.9,
-          "rev_fcrd": 33.3,
-          "gross": 71.2,
-          "net": 39.7,
-          "cycles_per_day": 0.85
+          "rev_da": 33.4,
+          "rev_fcrn": 3.8,
+          "rev_fcrd": 33.4,
+          "gross": 70.7,
+          "net": 39.4,
+          "cycles_per_day": 0.83
         },
         "da_only": {
-          "rev_da": 39.1,
+          "rev_da": 39.7,
           "rev_fcrn": 0.0,
           "rev_fcrd": 0.0,
-          "gross": 39.1,
-          "net": 7.9,
-          "cycles_per_day": 0.96
+          "gross": 39.7,
+          "net": 8.4,
+          "cycles_per_day": 0.97
         },
-        "causal_share_of_oracle_pct": 87.6,
+        "causal_share_of_oracle_pct": 86.8,
         "description": "Generic LFP 2h battery (the dashboard default, shown in docs/img/battery_lab_fi.png)"
       },
       "sungrow_powertitan2_2h": {
@@ -108,32 +108,34 @@
         "energy_mwh": 5.015,
         "round_trip_efficiency": 0.895,
         "oracle": {
-          "rev_da": 27.2,
-          "rev_fcrn": 11.6,
-          "rev_fcrd": 44.8,
-          "gross": 83.6,
-          "net": 56.5,
+          "rev_da": 27.3,
+          "rev_fcrn": 11.5,
+          "rev_fcrd": 44.7,
+          "gross": 83.5,
+          "net": 56.4,
           "cycles_per_day": 0.78
         },
         "causal": {
           "rev_da": 36.0,
-          "rev_fcrn": 6.4,
-          "rev_fcrd": 32.2,
-          "gross": 74.6,
-          "net": 45.7,
-          "cycles_per_day": 0.95
+          "rev_fcrn": 5.7,
+          "rev_fcrd": 32.1,
+          "gross": 73.8,
+          "net": 45.0,
+          "cycles_per_day": 0.94
         },
         "da_only": {
-          "rev_da": 41.5,
+          "rev_da": 41.9,
           "rev_fcrn": 0.0,
           "rev_fcrd": 0.0,
-          "gross": 41.5,
-          "net": 13.8,
-          "cycles_per_day": 1.05
+          "gross": 41.9,
+          "net": 14.1,
+          "cycles_per_day": 1.07
         },
-        "causal_share_of_oracle_pct": 89.2,
+        "causal_share_of_oracle_pct": 88.3,
         "description": "Sungrow PowerTitan 2.0 (2h), datasheet values; the battery used by checks/test_battery_lab_data.py"
       }
-    }
+    },
+    "generated_on": "2026-10-30",
+    "forecast": "Diverse ensemble (L2 + median + Huber)"
   }
 }

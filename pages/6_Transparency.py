@@ -24,6 +24,21 @@ from src.data_loader import (
     render_country_selector, load_test_predictions, load_lear_forecast,
     load_model_summary, ZONE_LABELS,
 )
+from src.model.dm import diebold_mariano
+
+
+def dm_test(e1: np.ndarray, e2: np.ndarray, h: int = 24) -> tuple[float, float]:
+    """Diebold-Mariano (HAC h=24 + HLN) de src/model/dm.py. DM < 0 → modelo 1 mejor."""
+    return diebold_mariano(e1, e2, loss="mae", h=h, min_n=50)
+
+
+def _fmt_p(p: float):
+    """p-valor legible: '< 1e-6' en vez de 0.00e+00."""
+    if p < 1e-6:
+        return "< 1e-6"
+    return f"{p:.2e}" if p < 0.01 else round(p, 3)
+
+
 
 st.set_page_config(page_title="Transparency · Nordic Forecast",
                    layout="wide")
@@ -36,33 +51,6 @@ h1, h2, h3 { color: #1B2A4A; }
 
 MASTER_PATH = ROOT / "data" / "master" / "dataset_master.parquet"
 PRICE_COL = {"DK1": "price_DK1", "DK2": "price_DK2", "FI": "price_FI"}
-
-
-def dm_test(e1: np.ndarray, e2: np.ndarray, h: int = 24) -> tuple[float, float]:
-    """
-    Test de Diebold-Mariano sobre diferenciales de pérdida absoluta, con
-    varianza HAC (Newey-West, ventana h) y corrección de muestra pequeña de
-    Harvey-Leybourne-Newbold — el estándar de la literatura EPF (Lago 2021).
-    DM < 0 → el modelo 1 es mejor. Devuelve (estadístico, p-valor bilateral).
-    """
-    from scipy import stats
-    d = np.abs(e1) - np.abs(e2)
-    n = len(d)
-    if n < 50:
-        return np.nan, np.nan
-    dbar = d.mean()
-    # Varianza HAC con pesos de Bartlett
-    gamma0 = np.var(d, ddof=0)
-    var = gamma0
-    for k in range(1, h):
-        cov = np.mean((d[k:] - dbar) * (d[:-k] - dbar))
-        var += 2 * (1 - k / h) * cov
-    dm = dbar / np.sqrt(var / n)
-    # Corrección HLN
-    hln = np.sqrt((n + 1 - 2 * h + h * (h - 1) / n) / n)
-    dm_adj = dm * hln
-    p = 2 * (1 - stats.t.cdf(abs(dm_adj), df=n - 1))
-    return float(dm_adj), float(p)
 
 
 @st.cache_data(ttl=3600, show_spinner="Computing live scoreboard...")
@@ -160,7 +148,7 @@ st.markdown(
     "Accuracy figures for Nordic day-ahead price forecasts are rarely "
     "published in a form a reader can check. This page publishes ours: "
     "computed **live** from "
-    "the served model's out-of-sample test predictions against strong "
+    "the served model's out-of-sample test predictions against standard "
     "baselines, with Diebold-Mariano significance and the volatility context "
     "without which an MAE means nothing.")
 
@@ -192,13 +180,13 @@ dm_rows = []
 if sb.get("dm_vs_naive") and not np.isnan(sb["dm_vs_naive"][0]):
     s, p = sb["dm_vs_naive"]
     dm_rows.append({"Comparison": "Model vs naive-24h", "DM stat (HLN)": round(s, 2),
-                    "p-value": f"{p:.2e}" if p < 0.01 else round(p, 3),
+                    "p-value": _fmt_p(p),
                     "Verdict": "model significantly better" if (s < 0 and p < 0.05)
                                else "not significant"})
 if sb.get("dm_vs_lear") and not np.isnan(sb["dm_vs_lear"][0]):
     s, p = sb["dm_vs_lear"]
     dm_rows.append({"Comparison": "Model vs LEAR (zone-aware)", "DM stat (HLN)": round(s, 2),
-                    "p-value": f"{p:.2e}" if p < 0.01 else round(p, 3),
+                    "p-value": _fmt_p(p),
                     "Verdict": "model significantly better" if (s < 0 and p < 0.05)
                                else "not significant"})
 if dm_rows:
@@ -209,13 +197,17 @@ if dm_rows:
 
 if "coverage_p10_p90" in sb:
     st.markdown(f"**P10–P90 band coverage on the test window:** "
-                f"{sb['coverage_p10_p90']:.1%} (nominal 80%; includes the conformal "
-                "calibration half). "
-                "Raw quantile bands under-cover; the served bands use "
-                "conformal/ACI calibration — see `docs/decisions.md`.")
+                f"{sb['coverage_p10_p90']:.1%} (nominal 80%). The split-conformal "
+                "calibrator is fitted on the October–December 2025 validation quarter, "
+                "so this is out of sample. In Denmark it under-covers; prices there sat "
+                "above the validation level, but Finnish prices rose more and its coverage "
+                "held, so the cause is not established. In Finland it is close to the target. "
+                "The five quantiles are sorted in each hour after the conformal step. "
+                "Adaptive conformal inference with a daily update reaches about "
+                "79–80% (README and `docs/decisions.md`, DT-24).")
 
 # 2) Walk-forward mensual con contexto
-st.markdown("## 2 · Monthly walk-forward — skill is not seasonal luck")
+st.markdown("## 2 · Monthly walk-forward of a separate LightGBM")
 wf = monthly_walkforward(zone)
 if not wf.empty:
     fig = go.Figure()
@@ -236,11 +228,12 @@ if not wf.empty:
     mean_rmae = wf["rMAE"].mean()
     months_beating = int((wf["rMAE"] < 1).sum())
     st.markdown(
-        f"Expanding-window walk-forward, retrained monthly. Mean monthly rMAE "
+        f"Expanding-window walk-forward of a single LightGBM (not the served "
+        f"model), retrained monthly. Mean monthly rMAE "
         f"**{mean_rmae:.2f}**; the model beats the naive in "
         f"**{months_beating}/{len(wf)} months**. The orange line is each "
-        f"month's price volatility — error tracks volatility, which is why "
-        f"cross-period MAE comparisons without context are meaningless.")
+        f"month's price volatility, shown as context for comparing MAE "
+        f"across months.")
 else:
     st.info("Walk-forward CSV not found for this zone.")
 
@@ -257,10 +250,11 @@ if sb.get("regimes"):
 # 4) Reglas del marcador
 with st.expander("Scoreboard rules"):
     st.markdown("""
-1. **Out-of-sample only.** Everything on this page comes from the served
-   model's predictions on the held-out test window (train ends months before)
-   or from expanding-window walk-forward. No in-sample numbers exist anywhere.
-2. **Baselines are competitive.** Naive-24h is computed live from realised
+1. **Out-of-sample.** Everything on this page comes from the served model's
+   predictions on the test window, which was not used to fit or choose the
+   served models (train ends in September 2025; an earlier version was scored
+   on it, see DT-24), or from the expanding-window walk-forward.
+2. **Standard baselines.** Naive-24h is computed live from realised
    prices; LEAR is *zone-aware* (uses each zone's own wind/temperature — we
    strengthened our own baseline when an audit found otherwise, see DT-19).
 3. **Errors carry context.** Every MAE is shown next to the window's mean
@@ -268,11 +262,12 @@ with st.expander("Scoreboard rules"):
 4. **Significance, not vibes.** Diebold-Mariano with HAC variance and HLN
    correction, computed on this page at render time.
 5. **Limitations are printed**: 5-month test window (no summer), hourly
-   aggregation of a now-15-min market, band coverage ~78-80% vs 80% target.
-   Full registry: `docs/decisions.md` (DT-13…DT-21).
+   aggregation of a now-15-min market, split-conformal bands below the 80%
+   target in Denmark (daily ACI about 79-80%).
+   Full registry: `docs/decisions.md` (DT-13…DT-24).
 """)
 
 st.caption(
-    "All numbers on this page are recomputed from the pipeline's real "
-    "artifacts at render time. If a number here ever disagrees with the "
-    "README, trust this page and file a bug.")
+    "All numbers on this page are recomputed from the pipeline's artifacts "
+    "at render time. The window starts on 2 January, one day after the "
+    "README tables, so the figures differ slightly.")

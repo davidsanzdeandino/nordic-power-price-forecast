@@ -441,9 +441,10 @@ def step_reservoirs(master: pd.DataFrame, logger) -> pd.DataFrame:
 
     DECISIÓN TÉCNICA: el nivel de embalses NO/SE/FI es el driver estructural
     del precio nórdico (sistema hidro-dependiente). El dato es SEMANAL, así que
-    se reindexa al esqueleto horario con forward-fill (el último nivel publicado
-    aplica hasta que sale el siguiente). El LAG anti-leakage (1 semana) se aplica
-    en features.py, no aquí: aquí solo dejamos la serie alineada y visible.
+    se reindexa al esqueleto horario con forward-fill: el valor de la semana W
+    (marcado al inicio de W) ocupa las horas de W. El LAG anti-leakage (13 días,
+    features.RESERVOIR_LAG) se aplica en features.py, no aquí: aquí solo dejamos
+    la serie alineada y visible.
     """
     logger.info("\n  [9d] Integrando embalses hidroeléctricos (semanal→horario)...")
     raw_dir = CLEAN_DIR.parent / "raw"

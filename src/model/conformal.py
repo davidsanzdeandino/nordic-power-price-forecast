@@ -371,11 +371,51 @@ def calibrate_quantile_models(
     return cal
 
 
+# ── Reordenación monótona de cuantiles ────────────────────────────────────────
+
+QUANTILE_ORDER = ("P10", "P25", "P50", "P75", "P90")
+
+
+def sort_quantile_bands(bands: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """
+    Reordenación monótona (Chernozhukov, Fernández-Val y Galichon, 2010): en
+    cada hora, los valores de los cuantiles presentes se ordenan de menor a
+    mayor y se reparten en el orden P10 ≤ P25 ≤ P50 ≤ P75 ≤ P90.
+
+    Los modelos de cuantiles se ajustan por separado y el conformal ensancha
+    cada par por su lado, así que en algunas horas P75 puede quedar por encima
+    de P90 (o P10 por encima de P25). Ordenar no cambia el conjunto de valores
+    de cada hora y nunca sube la media de la pérdida pinball de los cuantiles
+    presentes (desigualdad de reordenación). La previsión puntual no
+    pasa por aquí. Las claves que no son cuantiles se devuelven tal cual.
+    """
+    keys = [q for q in QUANTILE_ORDER if q in bands]
+    out = dict(bands)
+    if len(keys) < 2:
+        return out
+    stacked = np.column_stack([np.asarray(bands[q], dtype=float) for q in keys])
+    stacked = np.sort(stacked, axis=1)
+    for i, q in enumerate(keys):
+        out[q] = stacked[:, i]
+    return out
+
+
+def count_crossed_hours(bands: Dict[str, np.ndarray]) -> int:
+    """Horas en las que algún cuantil queda por encima del siguiente."""
+    keys = [q for q in QUANTILE_ORDER if q in bands]
+    if len(keys) < 2:
+        return 0
+    stacked = np.column_stack([np.asarray(bands[q], dtype=float) for q in keys])
+    return int(np.any(np.diff(stacked, axis=1) < 0, axis=1).sum())
+
+
 # ── Adaptive Conformal Inference (ACI, Gibbs & Candès 2021) ───────────────────
 
 def adaptive_conformal_coverage(y_true, lower, upper,
                                 target_coverage: float = 0.80,
-                                gamma: float = 0.02) -> dict:
+                                gamma: float = 0.02,
+                                day_labels=None,
+                                return_path: bool = False) -> dict:
     """
     Adaptive Conformal Inference (ACI) — cobertura ONLINE robusta a distribution
     shift (Gibbs & Candès, 2021, https://arxiv.org/abs/2106.00170).
@@ -385,15 +425,28 @@ def adaptive_conformal_coverage(y_true, lower, upper,
     cuando ha habido fallos recientes y la estrecha cuando sobra-cubre, de modo
     que la cobertura a largo plazo converge al objetivo SEA CUAL SEA el proceso.
 
-    Aquí se implementa con un multiplicador de anchura k_t sobre la banda base:
-        intervalo_t = centro_t ± k_t · semianchura_base_t
+    Aquí se implementa con un multiplicador de anchura k sobre la banda base:
+        intervalo_t = centro_t ± k · semianchura_base_t
         err_t = 1 si y_t cae fuera del intervalo_t
-        k_{t+1} = max(0, k_t + gamma · (err_t − α))      con α = 1 − cobertura
+
+    Actualización:
+      - Sin day_labels (horaria): k_{t+1} = max(0, k_t + gamma · (err_t − α)).
+        Usa el error de la hora anterior, que en day-ahead no se conoce.
+      - Con day_labels (día de entrega local de cada hora): k es constante
+        dentro de cada día y, al cerrarse el día D,
+            k ← max(0, k + gamma · Σ_{h∈D} (err_h − α)),
+        así que la banda de D solo usa errores hasta las 23:00 de D-1, que es
+        lo que se conoce en la subasta day-ahead.
+    En los dos casos k empieza en 1 (la banda base) y α = 1 − cobertura.
 
     Args:
         y_true, lower, upper: arrays alineados temporalmente (orden cronológico).
         target_coverage:      cobertura objetivo (0.80 → α=0.20).
         gamma:                tasa de aprendizaje (0.01–0.05 típico).
+        day_labels:           etiqueta del día de entrega de cada hora (p. ej.
+                              index.tz_convert("Europe/Copenhagen").normalize()).
+        return_path:          añade 'k_path' (k usado en cada hora) y
+                              'covered_path' al resultado.
 
     Returns:
         dict con cobertura estática vs ACI, anchura media y trayectoria de k.
@@ -407,25 +460,40 @@ def adaptive_conformal_coverage(y_true, lower, upper,
 
     n = len(y)
     k = 1.0
-    covered_static = np.zeros(n, dtype=bool)
+    covered_static = (y >= lo) & (y <= hi)
     covered_aci = np.zeros(n, dtype=bool)
     width_aci = np.zeros(n)
     k_traj = np.zeros(n)
 
-    for t in range(n):
-        # Banda estática (k=1)
-        covered_static[t] = (y[t] >= lo[t]) & (y[t] <= hi[t])
-        # Banda ACI con el k actual
-        lo_t = center[t] - k * half[t]
-        hi_t = center[t] + k * half[t]
-        covered_aci[t] = (y[t] >= lo_t) & (y[t] <= hi_t)
-        width_aci[t] = hi_t - lo_t
-        k_traj[t] = k
-        # Actualización online del parámetro
-        err = 0.0 if covered_aci[t] else 1.0
-        k = max(0.0, k + gamma * (err - alpha))
+    if day_labels is None:
+        for t in range(n):
+            lo_t = center[t] - k * half[t]
+            hi_t = center[t] + k * half[t]
+            covered_aci[t] = (y[t] >= lo_t) & (y[t] <= hi_t)
+            width_aci[t] = hi_t - lo_t
+            k_traj[t] = k
+            err = 0.0 if covered_aci[t] else 1.0
+            k = max(0.0, k + gamma * (err - alpha))
+        update = "hourly"
+    else:
+        labels = np.asarray(day_labels)
+        if len(labels) != n:
+            raise ValueError("day_labels must have one label per observation")
+        # Bloques de horas consecutivas con la misma etiqueta (días en orden).
+        change = np.r_[True, labels[1:] != labels[:-1]] if n else np.zeros(0, bool)
+        starts = np.flatnonzero(change)
+        ends = np.r_[starts[1:], n]
+        for s, e in zip(starts, ends):
+            lo_d = center[s:e] - k * half[s:e]
+            hi_d = center[s:e] + k * half[s:e]
+            cov_d = (y[s:e] >= lo_d) & (y[s:e] <= hi_d)
+            covered_aci[s:e] = cov_d
+            width_aci[s:e] = hi_d - lo_d
+            k_traj[s:e] = k
+            k = max(0.0, k + gamma * float(np.sum((~cov_d).astype(float) - alpha)))
+        update = "daily"
 
-    return {
+    out = {
         "coverage_static": float(np.mean(covered_static)),
         "coverage_aci":    float(np.mean(covered_aci)),
         "target":          target_coverage,
@@ -434,7 +502,13 @@ def adaptive_conformal_coverage(y_true, lower, upper,
         "k_final":         float(k),
         "k_mean":          float(np.mean(k_traj)),
         "gamma":           gamma,
+        "update":          update,
     }
+    if return_path:
+        out["k_path"] = k_traj
+        out["covered_path"] = covered_aci
+    return out
+
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────

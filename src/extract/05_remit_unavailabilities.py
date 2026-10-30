@@ -20,7 +20,7 @@ Se agregan por zona y tipo de combustible para crear features:
   - % de capacidad de interconexión reducida
 
 Fuente: ENTSO-E Transparency Platform (usa entsoe-py)
-Documentación: https://transparency.entsoe.eu/content/static_content/Static%20content/web%20api/Guide.html
+Documentación: https://documenter.getpostman.com/view/7009892/2s93JtP3F6
 
 Dependencias:
     pip install entsoe-py

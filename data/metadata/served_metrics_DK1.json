@@ -1,10 +1,26 @@
 {
-  "MAE_test": 14.536,
-  "RMSE_test": 19.913,
-  "DirAcc_test": 82.61,
-  "R2_test": 0.8178,
+  "generated_by": "scripts/gen_served_metrics.py",
+  "generated_on": "2026-10-30",
+  "method": "predict.served_predictions over the test window (same code path as the Served row of src/model/evaluate.py)",
   "n_test": 3624,
-  "production_model": "LightGBM + AR",
+  "test_window_utc": [
+    "2026-01-01",
+    "2026-05-31 23:00"
+  ],
+  "MAE_test": 15.93,
+  "RMSE_test": 21.399,
+  "DirAcc_test": 83.88,
+  "R2_test": 0.7896,
+  "mean_forecast_minus_actual": -11.381,
+  "mean_price_test": 96.595,
+  "MAE_pct_of_mean_price": 16.5,
+  "served_model": "ensemble",
+  "use_ar": false,
+  "production_model": "Diverse ensemble (L2 + median + Huber)",
+  "MAE_persistence_24h": 26.693,
+  "rMAE_vs_persistence_24h": 0.597,
+  "MAE_change_vs_persistence_24h_pct": -40.3,
   "MAE_lear": 22.542,
-  "MAE_vs_lear": -8.006
+  "MAE_vs_lear": -6.612,
+  "MAE_change_vs_lear_pct": -29.3
 }

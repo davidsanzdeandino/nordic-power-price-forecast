@@ -1,6 +1,8 @@
 {
   "description": "Day-ahead price baselines on the out-of-sample test set (January to May 2026, hourly, UTC).",
-  "source": "Comparison tables printed by src/model/baselines.py (run_all_baselines) in the run of 2026-06-10; values copied as printed.",
+  "source": "Written by src/model/baselines.py (run_all_baselines), pipeline steps 15-17, one zone per step.",
+  "generated_on": "2026-10-29",
+  "method": "Persistence and the weekly mean use only past prices. LEAR is fitted once on the hours before the test start (2026-01-01, train plus validation) and uses the wind forecast and mean temperature of its own zone from the feature table of step 14. Every test hour with a prediction is scored.",
   "units": {
     "MAE": "EUR/MWh",
     "RMSE": "EUR/MWh",
@@ -13,7 +15,7 @@
     "weekly_mean_4w": "Weekly seasonal mean: average of the same hour and weekday over the previous 4 weeks.",
     "lear": "LEAR: linear ARX model with Ridge regularisation, using the wind and temperature of its own zone (zone-aware)."
   },
-  "notes": "rMAE_vs_persistence_24h is not printed by the run; it is derived here as MAE / MAE of persistence_24h from the same table, rounded to 3 decimals.",
+  "notes": "rMAE_vs_persistence_24h is MAE / MAE of persistence_24h for the same zone, rounded to 3 decimals.",
   "zones": {
     "DK1": {
       "test_period": {

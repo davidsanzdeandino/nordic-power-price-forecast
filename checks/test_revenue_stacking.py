@@ -9,8 +9,12 @@ reproduce la narrativa real del mercado (desplome FCR, giro a arbitraje),
 Comprobación manual, no un test de pytest: necesita data/master (generado por
 run_pipeline.py) e imprime los resultados; solo (3) se verifica con un assert.
 
-Uso:  python checks/test_revenue_stacking.py
+Uso:  python checks/test_revenue_stacking.py            # solo imprime
+      python checks/test_revenue_stacking.py --write    # y actualiza el bloque
+                                                        # yearly_perfect_foresight_ceiling
+                                                        # de results/battery_lab_fi.json
 """
+import json
 import sys
 import time
 from pathlib import Path
@@ -65,3 +69,32 @@ assert causal25["gross_annual"] <= oracle25["gross_annual"] * 1.001, \
     "El modo causal no puede superar al oracle"
 print()
 print("OK: causal <= oracle (sin lookahead bias)")
+
+# ── 4) Escritura del techo anual en results/battery_lab_fi.json ─────────────
+if "--write" in sys.argv[1:]:
+    out_path = ROOT / "results" / "battery_lab_fi.json"
+    data = json.load(open(out_path, encoding="utf-8"))
+    block = data["yearly_perfect_foresight_ceiling"]
+
+    def _k(v):
+        return round(float(v) / 1000, 1)
+
+    block["full_stack"] = {
+        str(y): {"rev_da": _k(r["rev_da_per_mw"]), "rev_fcrn": _k(r["rev_fcrn_per_mw"]),
+                 "rev_fcrd": _k(r["rev_fcrd_per_mw"]), "gross": _k(r["gross_per_mw"]),
+                 "net": _k(r["net_per_mw"])}
+        for y, r in yearly.iterrows()
+    }
+    block["day_ahead_only"] = {
+        str(y): {"rev_da": _k(r["rev_da_per_mw"]), "gross": _k(r["gross_per_mw"]),
+                 "net": _k(r["net_per_mw"])}
+        for y, r in yearly_da.iterrows()
+    }
+    block["source"] = ("written by checks/test_revenue_stacking.py --write (yearly_stack_summary, "
+                       "mode oracle with the actual day-ahead price as forecast, so both "
+                       "day-ahead and reserve prices are known; 2026 covers January to May, "
+                       "annualised)")
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    print(f"\nOK -> results/{out_path.name} (yearly_perfect_foresight_ceiling)")

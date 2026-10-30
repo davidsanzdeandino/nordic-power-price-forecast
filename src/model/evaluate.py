@@ -1,20 +1,26 @@
 """
 evaluate.py
 ===========
-Evaluación completa del modelo predictivo — Fase 2.
+Evaluación del modelo servido en el test (ene-may 2026) — Fase 2.
 
 Módulos:
-  1. Métricas técnicas        — MAE, RMSE, sMAPE, DirAcc, R² vs todos los baselines
-  2. Análisis de errores      — por hora, estación, nivel de precio, viento, autocorrelación
+  1. Métricas técnicas        — fila «Served» (la ruta de predict_with_bands,
+                                la misma del dashboard y de las métricas
+                                servidas), comparadores en bruto (LightGBM,
+                                ensemble) y los 3 baselines
+  2. Análisis de errores      — por hora, estación, nivel de precio y viento
   3. Valor económico          — simulación EUR para 3 perfiles de usuario
-  4. Tabla comparativa final  — todos los modelos juntos
+  4. Bandas                   — cobertura del conformal ajustado en
+                                validación, ACI con actualización diaria,
+                                pinball y CRPS sobre las bandas servidas
+  5. Diebold-Mariano (HAC)    — descriptivos: el test no decide nada
+  6. Batería                  — LP diario con la previsión servida
 
-DECISIÓN TÉCNICA: Además de las métricas técnicas se reporta el valor
-económico (EUR). Un MAE de 7.3 EUR/MWh es difícil de interpretar por sí
-solo; el ahorro anual en EUR frente a una estrategia naive lo traduce a
-una magnitud que el lector entiende directamente.
+El test no se usa para elegir, ajustar ni calibrar: el modelo servido, el AR y
+el conformal salen de train.py (validación oct-dic 2025). Escribe
+results/evaluation_test2026_<zona>.json.
 
-Perfiles de usuario simulados (según doc Fase 2):
+Perfiles de usuario simulados:
   A. Consumidor industrial  — 5 MW de flexibilidad, desplaza consumo
                               de las 3 horas más caras del día a las 3 más baratas
   B. Trader day-ahead       — estrategia long/short basada en predicción de
@@ -22,14 +28,14 @@ Perfiles de usuario simulados (según doc Fase 2):
   C. Operador EV charging   — 2 MW de carga flexible, carga en las 4h más baratas
 
 Uso:
-    python src/model/evaluate.py               # Evalúa DK1
-    python src/model/evaluate.py --zone DK2
-    python src/model/evaluate.py --zone DK1 --full   # Incluye análisis de errores detallado
+    python src/model/evaluate.py --zone DK1
+    python src/model/evaluate.py --all --full
 """
 
 import sys
 import pickle
 import argparse
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -45,6 +51,10 @@ from src.utils.logger import get_logger, save_run_metadata
 from src.model.baselines import (
     PersistenceBaseline, WeeklyMeanBaseline, LEARBaseline, _compute_metrics
 )
+from src.model.config import (
+    TRAIN_END, VAL_START, VAL_END, TEST_START, TEST_END, DELIVERY_TZ, RESULTS_DIR,
+)
+from src.model import dm as _dm
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 
@@ -53,9 +63,6 @@ MODELS_DIR    = ROOT / "data" / "models"
 PLOTS_DIR     = ROOT / "data" / "plots"
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-TEST_START = "2026-01-01"
-TEST_END   = "2026-05-31 23:00"
-
 # Parámetros de simulación económica
 HOURS_PER_YEAR    = 8760
 INDUSTRIAL_MW     = 5.0     # MW de flexibilidad consumidor industrial
@@ -63,10 +70,11 @@ TRADER_VOLUME_MWH = 1.0     # MWh por hora operado por el trader
 EV_MW             = 2.0     # MW de carga EV flexible
 DAILY_FLEX_HOURS  = 4       # Horas de flexibilidad diaria (EV y consumidor)
 
+# ACI: tasa de aprendizaje fija (no se ajustó) y objetivo de cobertura
+ACI_GAMMA  = 0.03
+ACI_TARGET = 0.80
+
 # Mínimo de horas por día para incluirlo en la simulación económica.
-# DECISIÓN TÉCNICA: El dataset puede tener días con cobertura parcial
-# (e.g. ~12h/día si price_DK1 tiene ~50% nulos). Con 6h ya se puede
-# simular una estrategia de desplazamiento razonable.
 MIN_HOURS_PER_DAY = 6
 
 
@@ -74,46 +82,40 @@ MIN_HOURS_PER_DAY = 6
 
 def load_model_and_data(zone: str, logger):
     """
-    Carga el modelo entrenado, metadatos y datos de features.
+    Carga el LightGBM de referencia, metadatos, cuantiles y datos de test.
 
     Returns:
         (model, quantile_models, meta, X_test, y_test, df_full)
     """
-    # Modelo principal
     model_path = MODELS_DIR / f"lightgbm_{zone}.pkl"
     if not model_path.exists():
         raise FileNotFoundError(
             f"Modelo no encontrado: {model_path}\n"
             f"  → Entrena primero: python src/model/train.py --zone {zone}"
         )
-
     with open(model_path, "rb") as f:
         model = pickle.load(f)
-
-    # Metadatos (feature names, hiperparámetros)
-    meta_path = MODELS_DIR / f"model_meta_{zone}.pkl"
-    with open(meta_path, "rb") as f:
+    with open(MODELS_DIR / f"model_meta_{zone}.pkl", "rb") as f:
         meta = pickle.load(f)
-
-    # Modelos quantile
-    q_path = MODELS_DIR / f"quantile_models_{zone}.pkl"
-    with open(q_path, "rb") as f:
+    with open(MODELS_DIR / f"quantile_models_{zone}.pkl", "rb") as f:
         quantile_models = pickle.load(f)
 
     logger.info(f"  Modelo: {model_path.name} | Features: {meta['n_features']}")
 
-    # Dataset de features
     df = pd.read_parquet(FEATURES_PATH)
     df = df.sort_index()
 
     feature_cols = meta["feature_cols"]
     target_col   = f"price_{zone}"
 
-    # Rellenar NaN residuales igual que en train.py
+    # Rellenar NaN con las medianas de train guardadas por train.py
+    fill = meta.get("fill_values")
+    if fill is None:
+        logger.warning("  model_meta sin fill_values: medianas de las filas <= TRAIN_END")
+        train_rows = df.index <= pd.Timestamp(TRAIN_END, tz="UTC")
+        fill = df.loc[train_rows, feature_cols].median().to_dict()
     df_model = df[[target_col] + feature_cols].copy()
-    for col in feature_cols:
-        if df_model[col].isna().any():
-            df_model[col] = df_model[col].fillna(df_model[col].median())
+    df_model[feature_cols] = df_model[feature_cols].fillna(pd.Series(fill))
 
     test_mask = (df_model.index >= pd.Timestamp(TEST_START, tz="UTC")) & \
                 (df_model.index <= pd.Timestamp(TEST_END, tz="UTC"))
@@ -130,31 +132,12 @@ def load_model_and_data(zone: str, logger):
 
 # ── 1. Métricas técnicas completas ───────────────────────────────────────────
 
-def diebold_mariano(errors_a, errors_b, loss: str = "mae") -> tuple:
+def diebold_mariano(errors_a, errors_b, loss: str = "mae", h: int = 24) -> tuple:
     """
-    Test de Diebold-Mariano de igualdad de precisión predictiva.
-    (La herramienta estándar en EPF — Lago et al. 2021; en epftoolbox.)
-
-    H0: ambos modelos tienen la misma precisión.
-    errors_a, errors_b: errores (y_true − y_pred) de los modelos A y B.
-    Devuelve (estadístico DM, p-valor a dos colas). DM<0 ⇒ A mejor que B.
+    Diebold-Mariano con varianza HAC (Newey-West, h) y corrección HLN.
+    Reexporta src.model.dm.diebold_mariano. DM < 0 ⇒ A mejor que B.
     """
-    from scipy.stats import norm
-    a = np.asarray(errors_a, float); b = np.asarray(errors_b, float)
-    if loss == "mse":
-        d = a ** 2 - b ** 2
-    else:  # mae
-        d = np.abs(a) - np.abs(b)
-    d = d[~np.isnan(d)]
-    n = len(d)
-    if n < 30:
-        return np.nan, np.nan
-    var_d = np.var(d, ddof=0)
-    if var_d <= 0:
-        return np.nan, np.nan
-    dm = float(np.mean(d) / np.sqrt(var_d / n))
-    p = float(2 * (1 - norm.cdf(abs(dm))))
-    return dm, p
+    return _dm.diebold_mariano(errors_a, errors_b, loss=loss, h=h)
 
 
 def pinball_and_crps(y_true, quantile_preds: dict) -> dict:
@@ -178,142 +161,108 @@ def pinball_and_crps(y_true, quantile_preds: dict) -> dict:
 
 def compute_all_metrics(zone: str, model, X_test: pd.DataFrame,
                         y_test: pd.Series, df: pd.DataFrame,
-                        logger) -> tuple:
+                        logger, served: pd.DataFrame = None) -> tuple:
     """
-    Calcula métricas para LightGBM (raw + AR), Ensemble y los 3 baselines.
-    Devuelve (tabla comparativa, dict de predicciones para análisis avanzado).
+    Métricas en el test: fila «Served» (predict_with_bands, la ruta del
+    dashboard), comparadores en bruto (LightGBM train+val, LightGBM train,
+    ensemble) y baselines. El test no decide nada: todo es descriptivo.
+
+    Args:
+        served: salida de predict.served_predictions(zone) (si es None se
+                calcula aquí).
+
+    Returns:
+        (tabla comparativa, dict de predicciones alineadas con y_test)
     """
+    from src.model.predict import served_predictions
+
     logger.info("\n[1] Calculando métricas técnicas...")
     target_col = f"price_{zone}"
     series     = df[target_col].dropna()
 
+    if served is None:
+        served = served_predictions(zone, TEST_START, TEST_END, include_pre_conformal=True)
+    common = y_test.index.intersection(served.index)
+    if len(common) < len(y_test):
+        logger.warning(f"  {len(y_test) - len(common)} horas del test sin predicción servida")
+    y_c = y_test.loc[common]
+    X_c = X_test.loc[common]
+    served = served.loc[common]
+
     results = []
+    preds_out = {"index": common, "y": y_c.to_numpy(dtype=float)}
 
-    # ── LightGBM (raw) ──
-    preds_lgbm = model.predict(X_test)
-    m_lgbm = _compute_metrics(y_test, pd.Series(preds_lgbm, index=y_test.index), "LightGBM")
-    results.append(m_lgbm)
+    # ── Modelo servido (la cifra de cabecera) ──
+    preds_out["served"] = served["price_pred"].to_numpy(dtype=float)
+    results.append(_compute_metrics(y_c, served["price_pred"], "Served"))
 
-    # ── LightGBM + AR correction (day-ahead = solo residuos conocidos) ──
-    from src.model.ar_correction import ARResidualCorrector, simulate_day_ahead_correction
-    ar_path = MODELS_DIR / f"ar_corrector_{zone}.pkl"
-    if ar_path.exists():
-        ar_corrector = ARResidualCorrector.load(str(ar_path))
-        da_metrics_lgbm = simulate_day_ahead_correction(
-            y_test.values, preds_lgbm, ar_corrector, verbose=False
-        )
-        # Reconstruir serie para métricas (excluir primer día)
-        n_test = len(y_test)
-        preds_lgbm_da = ar_corrector.correct_day_ahead(
-            preds_lgbm[24:], y_test.values[:24] - preds_lgbm[:24]
-        )
-        # Usar simulate completo para métricas consistentes
-        preds_lgbm_ar = preds_lgbm.copy()
-        residuals_lgbm = y_test.values - preds_lgbm
-        n_days = n_test // 24
-        for d in range(1, n_days):
-            s, e = d * 24, min((d + 1) * 24, n_test)
-            last_r = residuals_lgbm[max(0, s - ar_corrector.best_order):s]
-            if len(last_r) < ar_corrector.best_order:
-                last_r = np.pad(last_r, (ar_corrector.best_order - len(last_r), 0))
-            preds_lgbm_ar[s:e] = ar_corrector.correct_day_ahead(preds_lgbm[s:e], last_r)
-        m_lgbm_ar = _compute_metrics(
-            y_test.iloc[24:],
-            pd.Series(preds_lgbm_ar[24:], index=y_test.index[24:]),
-            "LightGBM+AR_DA"
-        )
-        results.append(m_lgbm_ar)
-        logger.info(f"  AR correction (day-ahead): MAE {m_lgbm['MAE']:.3f} → {m_lgbm_ar['MAE']:.3f} "
-                    f"({(m_lgbm['MAE'] - m_lgbm_ar['MAE']) / m_lgbm['MAE'] * 100:.1f}%)")
-    else:
-        preds_lgbm_ar = preds_lgbm
-        logger.info("  AR corrector no encontrado — omitiendo corrección AR")
+    # ── Comparadores en bruto ──
+    preds_lgbm = model.predict(X_c)
+    preds_out["lgbm"] = np.asarray(preds_lgbm, dtype=float)
+    results.append(_compute_metrics(y_c, pd.Series(preds_lgbm, index=common), "LightGBM"))
 
-    # Predicciones que se devuelven para análisis avanzado (DM test, batería)
-    preds_out = {"lgbm": np.asarray(preds_lgbm), "lgbm_ar": np.asarray(preds_lgbm_ar)}
+    lgb_train_path = MODELS_DIR / f"lightgbm_train_{zone}.pkl"
+    if lgb_train_path.exists():
+        with open(lgb_train_path, "rb") as f:
+            lgbm_train = pickle.load(f)
+        p = lgbm_train.predict(X_c)
+        preds_out["lgbm_train"] = np.asarray(p, dtype=float)
+        results.append(_compute_metrics(y_c, pd.Series(p, index=common), "LightGBM_train"))
 
-    # ── Ensemble (si está disponible) ──
     ens_path = MODELS_DIR / f"ensemble_{zone}.pkl"
     if ens_path.exists():
-        try:
-            from src.model.diverse_ensemble import DiverseObjectiveEnsemble
-            ensemble = DiverseObjectiveEnsemble.load(str(ens_path))
-            preds_ens = ensemble.predict(X_test)
-            preds_out["ens"] = np.asarray(preds_ens)
-            m_ens = _compute_metrics(
-                y_test, pd.Series(preds_ens, index=y_test.index), "Ensemble"
-            )
-            results.append(m_ens)
+        from src.model.diverse_ensemble import DiverseObjectiveEnsemble
+        ensemble = DiverseObjectiveEnsemble.load(str(ens_path))
+        p = ensemble.predict(X_c)
+        preds_out["ens"] = np.asarray(p, dtype=float)
+        results.append(_compute_metrics(y_c, pd.Series(p, index=common), "Ensemble"))
 
-            # Ensemble + AR (day-ahead realista)
-            ar_ens_path = MODELS_DIR / f"ar_corrector_ensemble_{zone}.pkl"
-            if ar_ens_path.exists():
-                ar_ens = ARResidualCorrector.load(str(ar_ens_path))
-                preds_ens_ar = preds_ens.copy()
-                residuals_ens = y_test.values - preds_ens
-                n_test_ens = len(y_test)
-                n_days_ens = n_test_ens // 24
-                for d in range(1, n_days_ens):
-                    s, e = d * 24, min((d + 1) * 24, n_test_ens)
-                    last_r = residuals_ens[max(0, s - ar_ens.best_order):s]
-                    if len(last_r) < ar_ens.best_order:
-                        last_r = np.pad(last_r, (ar_ens.best_order - len(last_r), 0))
-                    preds_ens_ar[s:e] = ar_ens.correct_day_ahead(preds_ens[s:e], last_r)
-                preds_out["ens_ar"] = np.asarray(preds_ens_ar)
-                m_ens_ar = _compute_metrics(
-                    y_test.iloc[24:],
-                    pd.Series(preds_ens_ar[24:], index=y_test.index[24:]),
-                    "Ensemble+AR_DA"
-                )
-                results.append(m_ens_ar)
-        except Exception as e:
-            logger.info(f"  Ensemble no disponible para métricas: {e}")
-
-    # ── Baselines ──
+    # ── Baselines (mismo test; persistencia y LEAR son los de results/baselines) ──
     p1 = PersistenceBaseline(lag=24)
-    m1 = p1.evaluate(series, TEST_START)
-    results.append(m1)
+    results.append(p1.evaluate(series, TEST_START))
+    preds_out["persistence"] = series.shift(24).reindex(common).to_numpy(dtype=float)
 
     p2 = WeeklyMeanBaseline(n_weeks=4)
-    m2 = p2.evaluate(series, TEST_START)
-    results.append(m2)
+    results.append(p2.evaluate(series, TEST_START))
 
     p3 = LEARBaseline(alpha=0.1, zone=zone)   # viento y temperatura de la propia zona
-    m3 = p3.evaluate(series, TEST_START, df_extra=df)
-    results.append(m3)
+    results.append(p3.evaluate(series, TEST_START, df_extra=df))
+    lear_pred = p3.predict(series, TEST_START, df_extra=df)
+    preds_out["lear"] = lear_pred.reindex(common).to_numpy(dtype=float)
 
     df_metrics = pd.DataFrame(results).set_index("model")
 
-    # Mejora relativa del mejor modelo sobre cada baseline
-    best_model = df_metrics["MAE"].idxmin()
     for baseline in ["Persistence_24h", "WeeklyMean_4w", "LEAR"]:
         if baseline in df_metrics.index:
             improvement = (df_metrics.loc[baseline, "MAE"] -
-                           df_metrics.loc[best_model, "MAE"]) / \
+                           df_metrics.loc["Served", "MAE"]) / \
                           df_metrics.loc[baseline, "MAE"] * 100
-            logger.info(f"  {best_model} vs {baseline}: "
-                        f"MAE {improvement:+.1f}% {'mejor' if improvement > 0 else 'peor'}")
+            logger.info(f"  Served vs {baseline}: MAE {improvement:+.1f}%")
 
     logger.info(f"\n  {'─'*65}")
     logger.info(f"  {'Modelo':<22} {'MAE':>8} {'RMSE':>8} {'sMAPE':>8} "
                 f"{'DirAcc':>8} {'R²':>8}")
     logger.info(f"  {'─'*65}")
     for model_name, row in df_metrics.iterrows():
-        marker = " ◄" if model_name == best_model else ""
+        marker = " ◄ servido" if model_name == "Served" else ""
         logger.info(f"  {model_name:<22} {row['MAE']:>8.3f} {row['RMSE']:>8.3f} "
                     f"{row['sMAPE']:>7.2f}% {row['DirAcc']:>7.1f}% "
                     f"{row['R2']:>8.4f}{marker}")
     logger.info(f"  {'─'*65}")
 
+    preds_out["served_frame"] = served
     return df_metrics, preds_out
 
 
 # ── 2. Análisis de errores ────────────────────────────────────────────────────
 
-def analyze_errors(zone: str, model, X_test: pd.DataFrame,
+def analyze_errors(zone: str, preds: pd.Series,
                    y_test: pd.Series, df: pd.DataFrame, logger) -> dict:
     """
-    Análisis sistemático de dónde y cuándo falla el modelo.
+    Análisis sistemático de dónde y cuándo falla el modelo servido.
+
+    Args:
+        preds: previsión servida alineada con y_test.
 
     Segmentaciones:
       A. Error por hora del día     — ¿falla más en picos de mañana/tarde?
@@ -324,15 +273,8 @@ def analyze_errors(zone: str, model, X_test: pd.DataFrame,
     """
     logger.info("\n[2] Análisis de errores sistemáticos...")
 
-    preds_raw = model.predict(X_test)
-
-    # Análisis sobre predicciones RAW (sin AR) para métricas honestas
-    # El AR day-ahead solo aporta ~3-8% mejora real — el análisis de errores
-    # debe reflejar el rendimiento del modelo base sin correcciones post-hoc
-    logger.info(f"  Análisis sobre predicciones LightGBM (sin corrección AR)")
-
-    # Usar predicciones sin AR para el análisis principal
-    preds = pd.Series(preds_raw, index=y_test.index, name="pred")
+    logger.info("  Análisis sobre la previsión servida (predict_with_bands)")
+    preds = pd.Series(np.asarray(preds, dtype=float), index=y_test.index, name="pred")
     errors = (y_test - preds).rename("error")
     abs_errors = errors.abs().rename("abs_error")
 
@@ -425,7 +367,7 @@ def _plot_error_analysis(zone: str, hourly_mae, season_mae,
         test_from = pd.Timestamp(TEST_START).strftime("%Y-%m-%d")
         test_to   = pd.Timestamp(TEST_END).strftime("%Y-%m-%d")
         fig = plt.figure(figsize=(14, 10))
-        fig.suptitle(f"Análisis de Errores — LightGBM {zone} "
+        fig.suptitle(f"Análisis de Errores — modelo servido {zone} "
                      f"(Test: {test_from} a {test_to} UTC)",
                      fontsize=14, fontweight="bold")
         gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.35)
@@ -497,10 +439,10 @@ def _plot_error_analysis(zone: str, hourly_mae, season_mae,
 #   3. Lookup del día anterior usa rango real en lugar de pd.date_range(24h).
 #   4. Escala anual basada en horas reales simuladas, no en días × 24.
 
-def simulate_economic_value(zone: str, model, X_test: pd.DataFrame,
+def simulate_economic_value(zone: str, preds: pd.Series,
                              y_test: pd.Series, logger) -> dict:
     """
-    Cuantifica en EUR el beneficio de usar el modelo vs estrategia naive.
+    Cuantifica en EUR el beneficio de usar la previsión servida vs estrategia naive.
 
     DECISIÓN TÉCNICA: Las simulaciones asumen que el modelo predice el
     precio 24h antes (contexto day-ahead real). Se escalan los resultados
@@ -511,14 +453,9 @@ def simulate_economic_value(zone: str, model, X_test: pd.DataFrame,
     """
     logger.info("\n[3] Simulación de valor económico...")
 
-    preds_raw = model.predict(X_test)
-    # Aplicar AR offline si está disponible (misma lógica que métricas)
-    from src.model.ar_correction import ARResidualCorrector
-    ar_path = MODELS_DIR / f"ar_corrector_{zone}.pkl"
-    if ar_path.exists():
-        ar_corrector = ARResidualCorrector.load(str(ar_path))
-        preds_raw = ar_corrector.correct_offline(y_test.values, preds_raw)
-    preds = pd.Series(preds_raw, index=y_test.index)
+    # Previsión servida (day-ahead): nada de correct_offline, que usa
+    # residuos intradía que no se conocen en la subasta.
+    preds = pd.Series(np.asarray(preds, dtype=float), index=y_test.index)
     actual = y_test
     idx    = actual.index.tz_convert("Europe/Copenhagen")
 
@@ -755,207 +692,209 @@ def simulate_economic_value(zone: str, model, X_test: pd.DataFrame,
 
 # ── 4. Función principal ──────────────────────────────────────────────────────
 
+def _coverage(y, lo, hi) -> float:
+    return float(np.mean((y >= lo) & (y <= hi)))
+
+
 def evaluate_zone(zone: str = "DK1", full_analysis: bool = True) -> dict:
     """
-    Pipeline completo de evaluación para una zona.
+    Evaluación completa de una zona en el test. Todo lo que se mide aquí es
+    descriptivo: el modelo servido, el AR y el conformal vienen de train.py.
 
-    Args:
-        zone:          Zona a evaluar ('DK1' o 'DK2')
-        full_analysis: Si True, incluye análisis de errores detallado y plots
-
-    Returns:
-        Dict con todas las métricas y resultados económicos.
+    Escribe results/evaluation_test2026_<zona>.json.
     """
+    from src.model.predict import served_predictions, served_model_label
+    from src.model.conformal import adaptive_conformal_coverage, count_crossed_hours
+    from src.model.results_io import write_json
+
     logger = get_logger(f"evaluate_{zone}")
     logger.info(f"=== EVALUACIÓN COMPLETA — Zona {zone} ===")
 
-    # Cargar modelo y datos
-    model, quantile_models, meta, X_test, y_test, df = load_model_and_data(
-        zone, logger
-    )
+    model, quantile_models, meta, X_test, y_test, df = load_model_and_data(zone, logger)
+    served_model = meta.get("served_model", "lightgbm")
+    use_ar = bool(meta.get("use_ar", False))
+    label = served_model_label(served_model, use_ar)
+    logger.info(f"  Modelo servido (elegido en validación): {label}")
 
-    # 1. Métricas técnicas
-    df_metrics, preds_out = compute_all_metrics(zone, model, X_test, y_test, df, logger)
+    # 1. Métricas técnicas (fila Served = predict_with_bands)
+    served = served_predictions(zone, TEST_START, TEST_END, include_pre_conformal=True)
+    df_metrics, preds = compute_all_metrics(zone, model, X_test, y_test, df, logger,
+                                            served=served)
+    idx = preds["index"]
+    y_arr = preds["y"]
+    served = preds["served_frame"]
+    served_series = pd.Series(preds["served"], index=idx)
+    y_c = pd.Series(y_arr, index=idx)
 
-    # 2. Análisis de errores
+    # 2. Análisis de errores (sobre la previsión servida)
     error_stats = {}
     if full_analysis:
-        error_stats = analyze_errors(zone, model, X_test, y_test, df, logger)
+        error_stats = analyze_errors(zone, served_series, y_c, df, logger)
 
-    # 3. Valor económico
-    econ_value = simulate_economic_value(zone, model, X_test, y_test, logger)
+    # 3. Valor económico (previsión servida)
+    econ_value = simulate_economic_value(zone, served_series, y_c, logger)
 
-    # 4. Walk-forward results (si existe)
+    # 4. Walk-forward (LightGBM, descriptivo)
     wf_path = MODELS_DIR / f"walkforward_{zone}.csv"
     wf_results = pd.read_csv(wf_path) if wf_path.exists() else pd.DataFrame()
     if not wf_results.empty:
-        logger.info(f"\n[4] Walk-forward validation summary:")
-        logger.info(f"  MAE mensual: media={wf_results['MAE'].mean():.2f} | "
+        logger.info(f"\n[4] Walk-forward (LightGBM, {len(wf_results)} pliegues): "
+                    f"MAE media={wf_results['MAE'].mean():.2f} | "
                     f"std={wf_results['MAE'].std():.2f} | "
-                    f"min={wf_results['MAE'].min():.2f} | "
-                    f"max={wf_results['MAE'].max():.2f}")
-        if "MAE_ar" in wf_results.columns:
-            logger.info(f"  MAE+AR:      media={wf_results['MAE_ar'].mean():.2f} | "
-                        f"std={wf_results['MAE_ar'].std():.2f} | "
-                        f"min={wf_results['MAE_ar'].min():.2f} | "
-                        f"max={wf_results['MAE_ar'].max():.2f}")
+                    f"min={wf_results['MAE'].min():.2f} | max={wf_results['MAE'].max():.2f}")
 
-    # 5. Conformal calibration — cobertura de bandas
-    conf_path = MODELS_DIR / f"conformal_{zone}.pkl"
-    conformal_stats = {}
-    if conf_path.exists():
-        logger.info(f"\n[5] Calibración de bandas (Conformal Prediction):")
-        from src.model.conformal import ConformalCalibrator
-        conformal_cal = ConformalCalibrator.load(str(conf_path))
+    # 5. Bandas servidas: conformal ajustado en validación, medido en TODO el test
+    logger.info("\n[5] Bandas servidas (conformal ajustado en validación):")
+    bands_pre = {q: served[f"{q}_preconf"].to_numpy(float)
+                 for q in ("P10", "P25", "P50", "P75", "P90") if f"{q}_preconf" in served}
+    bands_srv = {q: served[q].to_numpy(float)
+                 for q in ("P10", "P25", "P50", "P75", "P90") if q in served}
+    bands_unsorted = {q: served[f"{q}_presort"].to_numpy(float)
+                      for q in ("P10", "P25", "P50", "P75", "P90") if f"{q}_presort" in served}
+    conformal_stats = {
+        "calibrated_on": f"validation quarter {VAL_START} to {VAL_END} (train.py)",
+        "measured_on": "whole test window, served bands",
+        "n_hours": int(len(y_arr)),
+        "P10_P90_before_conformal_pct": 100 * _coverage(y_arr, bands_pre["P10"], bands_pre["P90"]),
+        "P10_P90_served_pct": 100 * _coverage(y_arr, bands_srv["P10"], bands_srv["P90"]),
+        "P25_P75_before_conformal_pct": 100 * _coverage(y_arr, bands_pre["P25"], bands_pre["P75"]),
+        "P25_P75_served_pct": 100 * _coverage(y_arr, bands_srv["P25"], bands_srv["P75"]),
+        "P10_P90_width_before_conformal": float(np.mean(bands_pre["P90"] - bands_pre["P10"])),
+        "P10_P90_width_served": float(np.mean(bands_srv["P90"] - bands_srv["P10"])),
+        "quantiles_sorted_per_hour": True,
+        "hours_with_crossed_quantiles_before_conformal": count_crossed_hours(bands_pre),
+        "hours_with_crossed_quantiles_before_sorting": count_crossed_hours(bands_unsorted),
+        "hours_with_crossed_quantiles_served": count_crossed_hours(bands_srv),
+    }
+    if bands_unsorted:
+        prob_unsorted = pinball_and_crps(y_arr, bands_unsorted)
+        conformal_stats.update({
+            "P10_P90_before_sorting_pct": 100 * _coverage(y_arr, bands_unsorted["P10"],
+                                                          bands_unsorted["P90"]),
+            "P25_P75_before_sorting_pct": 100 * _coverage(y_arr, bands_unsorted["P25"],
+                                                          bands_unsorted["P75"]),
+            "P10_P90_width_before_sorting": float(np.mean(bands_unsorted["P90"]
+                                                          - bands_unsorted["P10"])),
+            "pinball_loss_before_sorting": prob_unsorted["pinball_loss"],
+        })
+    logger.info(f"  Horas con cuantiles cruzados: antes de ordenar "
+                f"{conformal_stats['hours_with_crossed_quantiles_before_sorting']} → servido "
+                f"{conformal_stats['hours_with_crossed_quantiles_served']}")
+    logger.info(f"  P10-P90: antes del conformal {conformal_stats['P10_P90_before_conformal_pct']:.1f}% "
+                f"→ servido {conformal_stats['P10_P90_served_pct']:.1f}% (objetivo 80%)")
+    logger.info(f"  P25-P75: antes del conformal {conformal_stats['P25_P75_before_conformal_pct']:.1f}% "
+                f"→ servido {conformal_stats['P25_P75_served_pct']:.1f}% (objetivo 50%)")
 
-        # El conformal se calibró en la 1ª mitad del test (ver train.py). Para
-        # una cobertura HONESTA (out-of-sample), la medimos en la 2ª mitad,
-        # disjunta del set de calibración.
-        cut = len(X_test) // 2
-        X_ev, y_ev = X_test.iloc[cut:], y_test.iloc[cut:]
-        logger.info(f"  Cobertura medida out-of-sample en 2ª mitad del test "
-                    f"({len(X_ev)} horas, calibrado en la 1ª)")
-
-        # Bandas raw (sobre la mitad de evaluación)
-        qpreds = {q: qm.predict(X_ev) for q, qm in quantile_models.items()}
-
-        cov_raw_80 = float(np.mean(
-            (y_ev.values >= qpreds["P10"]) & (y_ev.values <= qpreds["P90"])
-        ))
-        cov_raw_50 = float(np.mean(
-            (y_ev.values >= qpreds["P25"]) & (y_ev.values <= qpreds["P75"])
-        ))
-
-        # Bandas calibradas
-        pred_test = model.predict(X_ev)
-        bands_adj = conformal_cal.calibrate_all_bands(
-            pred_test, qpreds, timestamps=y_ev.index
-        )
-        cov_conf_80 = float(np.mean(
-            (y_ev.values >= bands_adj["P10"]) & (y_ev.values <= bands_adj["P90"])
-        ))
-        cov_conf_50 = float(np.mean(
-            (y_ev.values >= bands_adj["P25"]) & (y_ev.values <= bands_adj["P75"])
-        ))
-
-        width_raw = float(np.mean(qpreds["P90"] - qpreds["P10"]))
-        width_conf = float(np.mean(bands_adj["P90"] - bands_adj["P10"]))
-
-        logger.info(f"  ┌───────────────────────────────────────────────┐")
-        logger.info(f"  │  CALIBRACIÓN DE BANDAS — {zone}                  │")
-        logger.info(f"  ├───────────────────────────────────────────────┤")
-        logger.info(f"  │  P10-P90 (target 80%):                        │")
-        logger.info(f"  │    Raw:       {cov_raw_80:>5.1%}                       │")
-        logger.info(f"  │    Conformal: {cov_conf_80:>5.1%}  OK                    │")
-        logger.info(f"  │  P25-P75 (target 50%):                        │")
-        logger.info(f"  │    Raw:       {cov_raw_50:>5.1%}                       │")
-        logger.info(f"  │    Conformal: {cov_conf_50:>5.1%}  OK                    │")
-        logger.info(f"  │  Ancho P10-P90:                               │")
-        logger.info(f"  │    Raw:       {width_raw:>5.1f} EUR/MWh               │")
-        logger.info(f"  │    Conformal: {width_conf:>5.1f} EUR/MWh               │")
-        logger.info(f"  └───────────────────────────────────────────────┘")
-
-        conformal_stats = {
-            "cov_80_raw": cov_raw_80, "cov_80_conformal": cov_conf_80,
-            "cov_50_raw": cov_raw_50, "cov_50_conformal": cov_conf_50,
-            "width_raw": width_raw, "width_conformal": width_conf,
-        }
-        if not wf_results.empty:
-            best_month  = wf_results.loc[wf_results['MAE'].idxmin(), 'month']
-            worst_month = wf_results.loc[wf_results['MAE'].idxmax(), 'month']
-            logger.info(f"  Mejor mes: {best_month} | Peor mes: {worst_month}")
-
-    # ── [6] Métricas avanzadas: DM test, scoring probabilístico, ACI, batería ──
-    logger.info("\n[6] Métricas avanzadas (rigor EPF)...")
+    # 6. Métricas avanzadas (descriptivas en el test)
+    logger.info("\n[6] Métricas avanzadas (descriptive, test)...")
     advanced = {}
-    y_arr = y_test.values
-    try:
-        qpreds = {q: qm.predict(X_test) for q, qm in quantile_models.items()}
-    except Exception:
-        qpreds = None
 
-    # (a) Diebold-Mariano: ¿la mejora del ensemble es estadísticamente significativa?
-    if "ens" in preds_out:
-        dm, p = diebold_mariano(y_arr - preds_out["ens"], y_arr - preds_out["lgbm"], loss="mae")
-        advanced["dm_ens_vs_lgbm"] = {"DM": dm, "p_value": p,
-                                      "ens_significantly_better": bool(dm < 0 and p < 0.05)}
-        if not np.isnan(p):
-            sig = "SIGNIFICATIVO (p<0.05)" if p < 0.05 else "no significativo"
-            logger.info(f"  DM ensemble vs LightGBM: DM={dm:+.2f}, p={p:.3f} "
-                        f"→ {'ensemble mejor' if dm < 0 else 'LightGBM mejor'}, {sig}")
+    # (a) Diebold-Mariano HAC (h=24) + HLN
+    dm_rows = {}
+    pairs = [("served_vs_lightgbm", "served", "lgbm"),
+             ("served_vs_lear", "served", "lear"),
+             ("ensemble_vs_lightgbm", "ens", "lgbm")]
+    for name, a, b in pairs:
+        if a in preds and b in preds:
+            ea, eb = y_arr - preds[a], y_arr - preds[b]
+            ok = ~(np.isnan(ea) | np.isnan(eb))
+            stat, p = diebold_mariano(ea[ok], eb[ok], loss="mae", h=24)
+            dm_rows[name] = {"DM": stat, "p_value": p, "n": int(ok.sum()),
+                             "better": (a if stat < 0 else b) if np.isfinite(stat) else None}
+            logger.info(f"  DM {name}: {stat:+.2f} (p={p:.4f})")
+    advanced["diebold_mariano"] = {
+        "label": "descriptive, test",
+        "method": "absolute loss, HAC variance (Newey-West, Bartlett weights, h=24), "
+                  "Harvey-Leybourne-Newbold correction, Student t(n-1)",
+        "convention": "DM < 0 means the first model is more accurate",
+        **dm_rows,
+    }
 
-    # (b) Scoring probabilístico propio: pinball + CRPS
-    if qpreds:
-        prob = pinball_and_crps(y_arr, qpreds)
-        advanced["probabilistic"] = prob
-        logger.info(f"  Pinball loss: {prob['pinball_loss']:.3f} €/MWh | "
-                    f"CRPS≈ {prob['crps_approx']:.3f} (aprox. 5 cuantiles)")
+    # (b) Pinball y CRPS sobre las bandas servidas
+    prob = pinball_and_crps(y_arr, bands_srv)
+    advanced["probabilistic"] = {**prob, "bands": ("served (AR-shifted, conformal, sorted per hour)"
+                                                   if use_ar
+                                                   else "served (conformal, sorted per hour)")}
+    logger.info(f"  Pinball: {prob['pinball_loss']:.3f} €/MWh | CRPS≈ {prob['crps_approx']:.3f}")
 
-        # (c) ACI — cobertura adaptativa online de las bandas P10-P90
-        from src.model.conformal import adaptive_conformal_coverage
-        aci = adaptive_conformal_coverage(y_arr, qpreds["P10"], qpreds["P90"],
-                                          target_coverage=0.80, gamma=0.03)
-        advanced["aci"] = aci
-        logger.info(f"  ACI P10-P90: estático {aci['coverage_static']:.1%} → "
-                    f"ACI {aci['coverage_aci']:.1%} (objetivo 80%)")
+    # (c) ACI con actualización diaria sobre las bandas servidas antes del conformal
+    day_labels = pd.DatetimeIndex(idx).tz_convert(DELIVERY_TZ).normalize()
+    aci = adaptive_conformal_coverage(y_arr, bands_pre["P10"], bands_pre["P90"],
+                                      target_coverage=ACI_TARGET, gamma=ACI_GAMMA,
+                                      day_labels=day_labels)
+    advanced["aci"] = {**aci, "bands": "served P10-P90 before the conformal step",
+                       "k0": 1.0, "gamma_note": "fixed, not tuned"}
+    logger.info(f"  ACI diario P10-P90: estático {aci['coverage_static']:.1%} → "
+                f"ACI {aci['coverage_aci']:.1%} (objetivo 80%)")
 
-    # (d) Backtest económico de batería (valor del forecast en €)
+    # (d) Backtest de batería con la previsión servida (y con la persistencia)
     try:
         from src.model.battery_backtest import battery_arbitrage_backtest
-        best_fc = preds_out.get("ens_ar", preds_out.get("ens", preds_out["lgbm"]))
-        df_bt = pd.DataFrame({"price_actual": y_arr, "price_pred": np.asarray(best_fc)},
-                             index=y_test.index)
+        df_bt = pd.DataFrame({"price_actual": y_arr, "price_pred": preds["served"],
+                              "price_persistence": preds["persistence"]}, index=idx)
         bt = battery_arbitrage_backtest(df_bt, capacity_mwh=2.0, power_mw=1.0,
                                         efficiency=0.90, method="lp")
-        advanced["battery"] = bt
+        bt_p = battery_arbitrage_backtest(df_bt, forecast_col="price_persistence",
+                                          capacity_mwh=2.0, power_mw=1.0,
+                                          efficiency=0.90, method="lp")
+        advanced["battery"] = {**bt, "forecast_used": "served"}
+        if bt_p:
+            advanced["battery_persistence_forecast"] = {
+                "profit_forecast_annual": bt_p["profit_forecast_annual"],
+                "pct_of_oracle_forecast": bt_p["pct_of_oracle_forecast"],
+                "n_days": bt_p["n_days"],
+            }
         if bt:
-            logger.info(f"  Batería LP (2MWh/1MW): forecast {bt['profit_forecast_annual']:.0f} €/año "
+            logger.info(f"  Batería LP (2MWh/1MW): servido {bt['profit_forecast_annual']:.0f} €/año "
                         f"({bt['pct_of_oracle_forecast']:.0f}% del oráculo) | "
-                        f"bate a naive en +{bt['forecast_vs_naive_uplift_annual']:.0f} €/año "
-                        f"(naive {bt['profit_naive_annual']:.0f} | oráculo {bt['profit_perfect_annual']:.0f})")
+                        f"horario fijo {bt['profit_naive_annual']:.0f} | "
+                        f"oráculo {bt['profit_perfect_annual']:.0f}")
     except Exception as e:
         logger.info(f"  Backtest batería no disponible: {e}")
 
-    # Guardar resultados completos.
-    # OJO: el modelo de PRODUCCIÓN se elige por test de Diebold-Mariano (no por MAE
-    # crudo). DK usa LightGBM (el ensemble no es significativamente mejor por DM);
-    # FI usa el ensemble (DM p<0.0001). Esto es lo que sirve predict.py (ENSEMBLE_ZONES).
-    # `lowest_mae_model` se guarda solo como referencia descriptiva, NO como elección.
-    lowest_mae_model = df_metrics["MAE"].idxmin()
-    ENSEMBLE_ZONES = {"FI"}
-    served_model = "Ensemble (diverse) + AR" if zone in ENSEMBLE_ZONES else "LightGBM"
+    test_prices = {"mean": float(np.mean(y_arr)), "std": float(np.std(y_arr, ddof=1)),
+                   "n": int(len(y_arr))}
+    bias = {name: float(np.mean(preds[name] - y_arr))
+            for name in ("served", "lgbm", "lgbm_train", "ens") if name in preds}
+
+    metrics_table = {m: {k: row[k] for k in ("n_obs", "MAE", "RMSE", "sMAPE", "DirAcc", "R2")}
+                     for m, row in df_metrics.iterrows()}
     all_results = {
-        "zone":             zone,
-        "served_model":     served_model,        # el que sirve predict.py (DM test)
-        "lowest_mae_model": lowest_mae_model,     # solo referencia (no es la elección)
-        "metrics":          df_metrics.to_dict(),
-        "error_stats":  {k: v.to_dict() if hasattr(v, "to_dict") else v
-                         for k, v in error_stats.items()},
-        "economic":     econ_value,
-        "conformal":    conformal_stats,
-        "advanced":     advanced,
-        "wf_mae_mean":  float(wf_results["MAE"].mean()) if not wf_results.empty else None,
+        "zone":          zone,
+        "generated_by":  "src/model/evaluate.py (evaluate_zone)",
+        "generated_on":  datetime.now().strftime("%Y-%m-%d"),
+        "method":        "single run of the served forecast (predict_with_bands: model chosen on "
+                         "validation, day-ahead AR per delivery day if selected, conformal bands "
+                         "fitted on validation) over the whole test window; comparators, DM, "
+                         "coverage, pinball/CRPS and the battery backtest come from this same run",
+        "test_window_utc": {"start": TEST_START, "end": TEST_END},
+        "served_model":  served_model,
+        "use_ar":        use_ar,
+        "served_label":  label,
+        "selection_note": "served model, AR term and conformal calibration were fixed "
+                          "on the validation quarter by src/model/train.py",
+        "metrics":       metrics_table,
+        "mean_forecast_minus_actual": bias,
+        "test_prices":   test_prices,
+        "error_stats":   error_stats if full_analysis else {},
+        "economic":      econ_value,
+        "conformal":     conformal_stats,
+        "advanced":      advanced,
+        "walk_forward_mae_mean": float(wf_results["MAE"].mean()) if not wf_results.empty else None,
     }
+    out = write_json(RESULTS_DIR / f"evaluation_test2026_{zone}.json", all_results)
 
     save_run_metadata(
         script_name=f"evaluate_{zone}",
         params={"zone": zone, "test_start": TEST_START, "test_end": TEST_END,
                 "full_analysis": full_analysis},
-        stats={
-            "MAE_lgbm":      float(df_metrics.loc["LightGBM", "MAE"]),
-            "MAE_lgbm_ar":   float(df_metrics.loc["LightGBM+AR_DA", "MAE"]) if "LightGBM+AR_DA" in df_metrics.index else None,
-            "MAE_ensemble":  float(df_metrics.loc["Ensemble", "MAE"]) if "Ensemble" in df_metrics.index else None,
-            "MAE_ensemble_ar": float(df_metrics.loc["Ensemble+AR_DA", "MAE"]) if "Ensemble+AR_DA" in df_metrics.index else None,
-            "MAE_lear":      float(df_metrics.loc["LEAR", "MAE"]) if "LEAR" in df_metrics.index else None,
-            "served_model":     served_model,
-            "lowest_mae_model": lowest_mae_model,
-            "economic":      {k: v.get("valor_incremental_anual_EUR")
-                              for k, v in econ_value.items()},
-        },
+        stats={"MAE_served": float(df_metrics.loc["Served", "MAE"]),
+               "served_label": label,
+               "economic": {k: v.get("valor_incremental_anual_EUR")
+                            for k, v in econ_value.items()}},
     )
 
-    logger.info(f"\nOK Evaluación {zone} completada.")
-    logger.info(f"  Plots en: {PLOTS_DIR}")
+    logger.info(f"\nOK Evaluación {zone} completada → results/{out.name}")
     return all_results
 
 
@@ -966,10 +905,9 @@ if __name__ == "__main__":
     parser.add_argument("--zone", default="DK1", choices=["DK1", "DK2", "FI"])
     parser.add_argument("--full", action="store_true",
                         help="Incluir análisis de errores detallado y plots")
-    parser.add_argument("--both", action="store_true",
-                        help="Evaluar DK1 y DK2")
+    parser.add_argument("--all", action="store_true", help="Evaluar DK1, DK2 y FI")
     args = parser.parse_args()
 
-    zones = ["DK1", "DK2"] if args.both else [args.zone]
+    zones = ["DK1", "DK2", "FI"] if args.all else [args.zone]
     for zone in zones:
         evaluate_zone(zone=zone, full_analysis=args.full)

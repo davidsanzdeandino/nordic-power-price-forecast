@@ -1,0 +1,155 @@
+{
+  "zone": "DK1",
+  "generated_by": "src/model/train.py (train_zone)",
+  "trained_at": "2026-10-29 19:48",
+  "splits_utc": {
+    "train_end": "2025-09-30 23:00",
+    "val_start": "2025-10-01",
+    "val_end": "2025-12-31 23:00",
+    "test_start": "2026-01-01",
+    "test_end": "2026-05-31 23:00"
+  },
+  "rows": {
+    "train": 24072,
+    "val": 2208,
+    "test": 3624
+  },
+  "features": {
+    "n": 166,
+    "rule": "feat_* columns not matching ^feat_(FI_|SE[134]_|EE_|sched_net_FI_|post_ol3), plus the calendar flags is_weekend and is_holiday*",
+    "nan_fill": "median of the training rows"
+  },
+  "hyperparameters": {
+    "source": "src/model/best_params.json",
+    "params": {
+      "learning_rate": 0.0325,
+      "num_leaves": 208,
+      "max_depth": 11,
+      "min_child_samples": 91,
+      "subsample": 0.8405,
+      "colsample_bytree": 0.6268,
+      "reg_alpha": 0.0362,
+      "reg_lambda": 0.0931
+    },
+    "point_models_n_estimators": 2000,
+    "early_stopping_rounds": 50,
+    "lightgbm_common": {
+      "random_state": 42,
+      "n_jobs": 4,
+      "deterministic": true,
+      "verbose": -1
+    }
+  },
+  "reference_default_lightgbm": {
+    "MAE_val": 13.2302,
+    "trees_early_stopping_val": 24
+  },
+  "optuna_MAE_val": null,
+  "served": {
+    "model": "ensemble",
+    "use_ar": false,
+    "trained_on": "train only (up to TRAIN_END); the validation quarter is used for early stopping, model choice, AR and calibration"
+  },
+  "selection_val": {
+    "rule": "lowest validation MAE wins; if LightGBM wins without DM significance (HAC h=24, HLN, p >= 0.05) the ensemble is served",
+    "MAE_val_ensemble": 12.0791,
+    "MAE_val_lightgbm_train": 15.7679,
+    "DM_ensemble_vs_lightgbm": -3.6671,
+    "DM_p_value": 0.0003,
+    "DM_convention": "DM < 0 means the ensemble is more accurate",
+    "n_val_hours": 2208,
+    "served_model": "ensemble",
+    "reason": "lower validation MAE",
+    "ensemble_n_trees": {
+      "l2": 44,
+      "median": 213,
+      "huber": 1143
+    },
+    "lightgbm_train_n_trees": 2000
+  },
+  "ar_val": {
+    "method": "expanding folds by local delivery month inside the validation quarter; offsets per delivery day from residuals up to 23:00 of the previous day (Europe/Copenhagen)",
+    "folds": [
+      {
+        "fit_months": [
+          "2025-10"
+        ],
+        "score_month": "2025-11",
+        "n_fit_hours": 743,
+        "n_scored_hours": 720,
+        "ar_order": 3,
+        "MAE_raw": 13.0668,
+        "MAE_ar": 12.8865
+      },
+      {
+        "fit_months": [
+          "2025-10",
+          "2025-11"
+        ],
+        "score_month": "2025-12",
+        "n_fit_hours": 1463,
+        "n_scored_hours": 744,
+        "ar_order": 3,
+        "MAE_raw": 9.3473,
+        "MAE_ar": 9.9775
+      }
+    ],
+    "MAE_raw_scored": 11.1766,
+    "MAE_ar_scored": 11.4082,
+    "use_ar": false,
+    "final_fit": {
+      "n_hours": 2208,
+      "best_order": 3,
+      "ar_coefs": [
+        1.0377,
+        -0.3851,
+        0.1671
+      ],
+      "intercept": 0.5281,
+      "residual_std": 10.701
+    }
+  },
+  "quantiles_val": {
+    "coverage_80_val_raw": 0.7473,
+    "coverage_50_val_raw": 0.4298,
+    "n_trees": {
+      "P10": 254,
+      "P25": 294,
+      "P50": 213,
+      "P75": 143,
+      "P90": 154
+    }
+  },
+  "conformal_val": {
+    "strategy": "adaptive",
+    "target": 0.8,
+    "fitted_on": "validation quarter, raw quantile bands",
+    "raw_coverage": 0.7473,
+    "n_calibration": 2208,
+    "calibrated_coverage_insample": 0.8007,
+    "raw_band_width": 38.4095,
+    "calibrated_band_width": 42.1879,
+    "width_increase_pct": 9.837
+  },
+  "walk_forward": {
+    "model": "LightGBM, 500 trees, expanding window, retrained monthly",
+    "note": "descriptive; not the served model and not used for any choice",
+    "folds": 24,
+    "first_month": "2024-06",
+    "last_month": "2026-05",
+    "MAE_monthly": {
+      "mean": 14.595,
+      "std": 3.0887,
+      "min": 8.644,
+      "max": 22.688
+    }
+  },
+  "top5_features": [
+    "feat_de_residual_load_fc",
+    "feat_DK2_residual_load",
+    "feat_wx_SE3_wind100m_avg",
+    "feat_DK1_residual_load",
+    "feat_de_wind_fc"
+  ],
+  "note": "No test-window metric is computed here; see results/evaluation_test2026_<zone>.json."
+}

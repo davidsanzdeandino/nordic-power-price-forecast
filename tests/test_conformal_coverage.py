@@ -83,3 +83,49 @@ def test_aci_gap_shrinks_with_series_length(rng):
         gaps.append(abs(res["coverage_aci"] - 0.80))
     assert gaps[0] > gaps[1] > gaps[2]
     assert gaps[2] < 0.005
+
+
+def test_daily_aci_keeps_k_constant_within_each_delivery_day(rng):
+    """Daily ACI: the band of day D only uses errors up to 23:00 of D-1."""
+    idx = pd.date_range("2026-01-01", "2026-04-30 23:00", freq="h", tz="UTC")
+    n = len(idx)
+    days = idx.tz_convert("Europe/Copenhagen").normalize()
+    scale = np.where(np.arange(n) < n // 2, 10.0, 30.0)
+    y = rng.normal(0, 1, n) * scale
+    lo, hi = np.full(n, -12.8), np.full(n, 12.8)
+
+    res = adaptive_conformal_coverage(y, lo, hi, 0.80, gamma=0.03,
+                                      day_labels=days, return_path=True)
+    k = res["k_path"]
+    for day in days.unique():
+        in_day = np.asarray(days == day)
+        assert np.ptp(k[in_day]) == 0.0
+    assert k[0] == 1.0
+    assert res["update"] == "daily"
+    # Moving the prices of one day changes k only from the next day onwards.
+    day = days.unique()[40]
+    in_day = np.asarray(days == day)
+    y2 = y.copy()
+    y2[in_day] += 500.0
+    k2 = adaptive_conformal_coverage(y2, lo, hi, 0.80, gamma=0.03,
+                                     day_labels=days, return_path=True)["k_path"]
+    upto = np.asarray(days <= day)
+    np.testing.assert_array_equal(k2[upto], k[upto])
+    assert not np.allclose(k2[~upto], k[~upto])
+    # Still tracks the target under the volatility shift.
+    assert abs(res["coverage_aci"] - 0.80) < 0.03
+    assert res["coverage_static"] < 0.65
+
+
+def test_daily_aci_update_is_the_sum_of_the_day(rng):
+    idx = pd.date_range("2026-02-01", periods=72, freq="h", tz="UTC")
+    days = idx.tz_convert("Europe/Copenhagen").normalize()
+    y = rng.normal(0, 20, len(idx))
+    lo, hi = np.full(len(idx), -10.0), np.full(len(idx), 10.0)
+    res = adaptive_conformal_coverage(y, lo, hi, 0.80, gamma=0.03,
+                                      day_labels=days, return_path=True)
+    k, cov = res["k_path"], res["covered_path"]
+    first = np.asarray(days == days[0])
+    second_start = int(np.argmax(~first))
+    expected = max(0.0, 1.0 + 0.03 * float(np.sum((~cov[first]).astype(float) - 0.2)))
+    assert k[second_start] == pytest.approx(expected)

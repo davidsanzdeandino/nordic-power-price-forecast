@@ -6,8 +6,12 @@ finlandés, potencialmente más precisas que las de ENTSO-E. Se añaden de forma
 ADITIVA al master (DK y el resto intactos) y luego se mide si de verdad mejoran
 el MAE de FI — si no aportan, se documentan y se quitan (sin inflar).
 
-Datasets (todos "updated once a day" = PREVISIÓN day-ahead, conocida antes de la
-subasta → leakage-safe, igual que las forecasts de ENTSO-E que ya usamos):
+Datasets (PREVISIÓN para el día finlandés siguiente, 00-24 hora finlandesa; la
+165, 246 y 247 se publican una vez al día a las 12:00 hora finlandesa, 11:00 CET,
+y la 372 a las 10:00, con actualización desde las 11:00). Se guardan por su
+startTime en UTC. La última hora CET de cada día de entrega (00-01 hora
+finlandesa del día siguiente) se publica después de la subasta: features.py la
+sustituye por la hora anterior (features._fingrid_known_at_auction).
   165 → fingrid_FI_load_fc_mw   (consumo/carga, prev. diaria)
   246 → fingrid_FI_wind_fc_mw   (eólica, prev. diaria)
   247 → fingrid_FI_solar_fc_mw  (solar, prev. diaria)

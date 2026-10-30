@@ -9,11 +9,13 @@ and report the measured number even when it is smaller.**
 Day-ahead forecasting DK1/DK2/FI with out-of-sample test-2026 metrics (MAE 14.5 /
 16.9 / 21.05 €/MWh; rMAE 0.54/0.55/0.61), conformal-ACI bands, zone-aware LEAR
 baselines, DM-test model selection — plus a Battery Lab that stacks FCR-N/FCR-D
-with DA arbitrage on realised TSO reserve prices and reproduces published
-market benchmarks without calibration. It also covers three things that are
+with DA arbitrage on realised TSO reserve prices and checks its revenue
+ceiling against published market figures. It also covers three things that are
 rarely available in the open: a Finnish BESS backtester on real Fingrid
 prices, an FCR forecastability study (DT-21), and a post-2021 zonal benchmark
 with a published protocol.
+
+> Note (2026-10-29): this roadmap was written in June 2026 for the first version, which chose the model with a Diebold-Mariano test on the test window; its figures (the MAE and rMAE above, the 92–93% day-ahead capture under "Explicitly deprioritized") are from that version. The current protocol and figures are in the README and in DT-24 of `docs/decisions.md`.
 
 ## Tier 1 — highest value per effort
 
@@ -75,7 +77,9 @@ with a published protocol.
 
 ## Tier 3 — engineering hardening
 
-8. **Tests + CI.** (S–M) pytest for: leakage gates (max same-timestamp
+8. **Tests + CI.** (S–M) Done since June (`tests/`, 106 tests, and
+   `.github/workflows/ci.yml`); still open: extractor schema checks.
+   Originally planned: pytest for: leakage gates (max same-timestamp
    correlation), LP invariants (causal ≤ oracle; reserve headroom respected),
    extractor schemas. GitHub Actions on push.
 9. **Live-price fallback for the dashboard.** (S) Elering API (FI/Baltic,

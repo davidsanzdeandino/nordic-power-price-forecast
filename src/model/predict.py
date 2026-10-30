@@ -50,14 +50,27 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from src.utils.logger import get_logger
 from src.model.features import generate_features
+from src.model.config import TRAIN_END, TEST_START, TEST_END, DELIVERY_TZ
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 
 FEATURES_PATH = ROOT / "data" / "master" / "dataset_features.parquet"
 MODELS_DIR    = ROOT / "data" / "models"
 
-# Zona horaria de display (para el dashboard)
-DISPLAY_TZ = "Europe/Copenhagen"
+# Zona horaria de display (para el dashboard) y de los días de entrega
+DISPLAY_TZ = DELIVERY_TZ
+
+# Etiquetas legibles del modelo servido (meta['served_model'])
+SERVED_LABELS = {
+    "ensemble": "Diverse ensemble (L2 + median + Huber)",
+    "lightgbm": "LightGBM",
+}
+
+
+def served_model_label(served_model: str, use_ar: bool) -> str:
+    """Etiqueta del modelo servido, p. ej. 'Diverse ensemble ... + day-ahead AR'."""
+    label = SERVED_LABELS.get(served_model, served_model)
+    return label + (" + day-ahead AR" if use_ar else "")
 
 # Columnas de salida estándar
 OUTPUT_COLS = ["timestamp_cet", "price_pred", "P10", "P25", "P75", "P90",
@@ -86,30 +99,35 @@ class PricePredictor:
         explanation = predictor.explain_prediction("2024-11-15T18:00")
     """
 
-    def __init__(self, zone: str = "DK1"):
+    def __init__(self, zone: str = "DK1", feature_data: pd.DataFrame = None):
         """
         Args:
-            zone: Zona de precio ('DK1' o 'DK2')
+            zone:         Zona de precio ('DK1', 'DK2' o 'FI')
+            feature_data: tabla de features a usar en lugar de
+                          data/master/dataset_features.parquet (la inyecta,
+                          p. ej., scripts/leakage_sensitivity.py).
         """
         self.zone   = zone
         self.logger = get_logger(f"predict_{zone}")
-        self._model           = None
+        self._model           = None   # LightGBM train+val (SHAP, importancia)
+        self._served_lgbm     = None   # LightGBM train (si se sirve LightGBM)
         self._quantile_models = None
         self._meta            = None
         self._feature_data    = None
         self._shap_explainer  = None
         self._ar_corrector    = None
         self._ensemble        = None   # Ensemble diverso (L2 + mediana + Huber)
-        # Selección de modelo POR ZONA según el test de Diebold-Mariano:
-        #   - DK1/DK2: LightGBM único (el ensemble NO mejora significativamente).
-        #   - FI:      Ensemble diverso (mercado muy volátil; el ensemble es
-        #              SIGNIFICATIVAMENTE mejor — MAE 21.4 vs 24.6, DM p<0.0001).
-        ENSEMBLE_ZONES = {"FI"}
-        self._use_ensemble    = zone in ENSEMBLE_ZONES
         self._conformal       = None   # Conformal calibrator (bandas)
+        # El modelo servido y el uso del AR los decide train.py EN VALIDACIÓN
+        # y los escribe en model_meta (served_model, use_ar).
+        self._served_model    = "lightgbm"
+        self._use_ar          = False
 
         self._load_models()
-        self._load_feature_data()
+        if feature_data is not None:
+            self._feature_data = feature_data.sort_index()
+        else:
+            self._load_feature_data()
 
     # ── Carga de modelos ──────────────────────────────────────────────────────
 
@@ -134,29 +152,38 @@ class PricePredictor:
         with open(q_path, "rb") as f:
             self._quantile_models = pickle.load(f)
 
-        # --- Corrector AR ---
-        from src.model.ar_correction import ARResidualCorrector
-        ar_path = MODELS_DIR / f"ar_corrector_{self.zone}.pkl"
-        if ar_path.exists():
-            self._ar_corrector = ARResidualCorrector.load(str(ar_path))
-            self.logger.info(f"  AR corrector: AR({self._ar_corrector.best_order})")
+        # --- Modelo servido (decidido en validación por train.py) ---
+        if "served_model" not in self._meta:
+            self.logger.warning(
+                "  model_meta sin 'served_model' (modelos anteriores al protocolo "
+                "de validación): se sirve LightGBM sin AR. Reentrena la zona.")
+        self._served_model = self._meta.get("served_model", "lightgbm")
+        self._use_ar = bool(self._meta.get("use_ar", False))
 
-        # --- Ensemble diverso (L2+mediana+Huber), usado en vez de LightGBM ---
-        ens_path = MODELS_DIR / f"ensemble_{self.zone}.pkl"
-        if ens_path.exists():
-            try:
-                from src.model.diverse_ensemble import DiverseObjectiveEnsemble
-                self._ensemble = DiverseObjectiveEnsemble.load(str(ens_path))
-                # Si hay ensemble, cargar su AR corrector específico
-                ar_ens_path = MODELS_DIR / f"ar_corrector_ensemble_{self.zone}.pkl"
-                if ar_ens_path.exists():
-                    self._ar_corrector = ARResidualCorrector.load(str(ar_ens_path))
-                    self.logger.info(f"  Ensemble diverso cargado con AR propio")
-                else:
-                    self.logger.info(f"  Ensemble diverso cargado (usa AR base)")
-            except Exception as e:
-                self.logger.info(f"  Ensemble .pkl no se pudo cargar: {e}")
-        # ----------------------------------
+        if self._served_model == "ensemble":
+            from src.model.diverse_ensemble import DiverseObjectiveEnsemble
+            ens_path = MODELS_DIR / f"ensemble_{self.zone}.pkl"
+            self._ensemble = DiverseObjectiveEnsemble.load(str(ens_path))
+        elif self._served_model == "lightgbm":
+            # Modelo servido entrenado solo con train; los modelos antiguos no
+            # lo tienen y se sirve el LightGBM principal.
+            lgb_train_path = MODELS_DIR / f"lightgbm_train_{self.zone}.pkl"
+            if lgb_train_path.exists():
+                with open(lgb_train_path, "rb") as f:
+                    self._served_lgbm = pickle.load(f)
+            else:
+                self._served_lgbm = self._model
+        else:
+            raise ValueError(f"served_model desconocido: {self._served_model}")
+
+        # --- Corrector AR day-ahead (ajustado en validación) ---
+        if self._use_ar:
+            from src.model.ar_correction import ARResidualCorrector
+            ar_path = MODELS_DIR / f"ar_corrector_served_{self.zone}.pkl"
+            self._ar_corrector = ARResidualCorrector.load(str(ar_path))
+            self.logger.info(f"  AR day-ahead: AR({self._ar_corrector.best_order})")
+        self.logger.info(f"  Modelo servido: "
+                         f"{served_model_label(self._served_model, self._use_ar)}")
 
         # --- Conformal calibrator (bandas calibradas) ---
         conf_path = MODELS_DIR / f"conformal_{self.zone}.pkl"
@@ -204,27 +231,59 @@ class PricePredictor:
         """
         Extrae la matriz de features para los timestamps dados.
 
-        Rellena NaN con la mediana histórica (estrategia conservadora).
-        Si un timestamp no existe en el dataset, usa interpolación o último valor.
+        Rellena los NaN con las medianas del tramo de train que guardó
+        train.py (meta['fill_values']), igual que en el entrenamiento.
         """
         feature_cols = self._meta["feature_cols"]
 
         # Alinear con el dataset de features
         X = self._feature_data.reindex(timestamps)[feature_cols]
 
-        # Rellenar NaN con mediana histórica (calculada sobre datos de entrenamiento)
-        for col in feature_cols:
-            if X[col].isna().any():
-                fill_val = self._feature_data[col].median()
-                X[col]   = X[col].fillna(fill_val)
-
+        fill = self._fill_values()
+        if X.isna().to_numpy().any():
+            X = X.fillna(pd.Series(fill))
         return X
+
+    def _fill_values(self) -> dict:
+        """Medianas de train por columna (de meta; si faltan, se calculan)."""
+        fill = self._meta.get("fill_values")
+        if fill is None:
+            # Modelos antiguos: mediana de las filas <= TRAIN_END, nunca del test.
+            train_rows = self._feature_data.index <= pd.Timestamp(TRAIN_END, tz="UTC")
+            fill = self._feature_data.loc[train_rows, self._meta["feature_cols"]].median().to_dict()
+            self._meta["fill_values"] = fill
+        return fill
+
+    def _served_predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Predicción en bruto del modelo servido (sin AR)."""
+        if self._served_model == "ensemble":
+            return np.asarray(self._ensemble.predict(X), dtype=float)
+        return np.asarray(self._served_lgbm.predict(X), dtype=float)
+
+    def _ar_offsets(self, available: pd.DatetimeIndex) -> np.ndarray:
+        """
+        Offsets AR day-ahead por día de entrega local: para cada día D, solo
+        residuos (precio real - predicción servida) hasta las 23:00 de D-1.
+        """
+        from src.model.ar_correction import day_ahead_offsets
+        order = self._ar_corrector.best_order
+        cutoffs = available.tz_convert(DISPLAY_TZ).normalize().tz_convert("UTC")
+        hist_start = cutoffs.min() - pd.Timedelta(hours=order)
+        hist_end = cutoffs.max()                       # exclusivo
+        target_col = f"price_{self.zone}"
+        actual = self._feature_data[target_col]
+        actual = actual[(actual.index >= hist_start) & (actual.index < hist_end)].dropna()
+        if len(actual):
+            resid = actual - self._served_predict(self._prepare_X(actual.index))
+        else:
+            resid = pd.Series(dtype=float, index=pd.DatetimeIndex([], tz="UTC"))
+        return day_ahead_offsets(available, resid, self._ar_corrector)
 
     # ── Predicción puntual ────────────────────────────────────────────────────
 
     def predict(self, timestamps: pd.DatetimeIndex) -> pd.Series:
         """
-        Predicción puntual (mediana) para los timestamps dados.
+        Predicción puntual en bruto del modelo servido (sin AR ni bandas).
 
         Args:
             timestamps: DatetimeIndex UTC tz-aware
@@ -233,21 +292,31 @@ class PricePredictor:
             Series con predicciones de precio (EUR/MWh)
         """
         X     = self._prepare_X(timestamps)
-        preds = self._model.predict(X)
+        preds = self._served_predict(X)
         return pd.Series(preds, index=timestamps, name=f"price_pred_{self.zone}")
 
     # ── Predicción con bandas de confianza ────────────────────────────────────
 
     def predict_with_bands(self, start: str = None,
                            hours: int = 24,
-                           end: str = None) -> pd.DataFrame:
+                           end: str = None,
+                           include_pre_conformal: bool = False) -> pd.DataFrame:
         """
         Predicción puntual + intervalos de confianza P10-P90.
+
+        Es la ruta del modelo servido (dashboard, evaluate.py y las métricas
+        servidas): modelo servido en bruto + offset AR day-ahead por día de
+        entrega (si use_ar) + bandas de cuantiles desplazadas con el mismo
+        offset + calibración conformal.
 
         Args:
             start: Timestamp de inicio (str ISO o None → última hora disponible)
             hours: Número de horas a predecir (si no se especifica end)
             end:   Timestamp de fin (str ISO, alternativa a hours)
+            include_pre_conformal: añade columnas <banda>_preconf con las bandas
+                   antes de la calibración conformal (ya desplazadas por el AR)
+                   y <banda>_presort con las bandas calibradas antes de
+                   ordenarlas por hora.
 
         Returns:
             DataFrame con columnas:
@@ -283,64 +352,25 @@ class PricePredictor:
 
         X = self._prepare_X(available)
 
-        # Predicción puntual — modelo de producción.
-        # DECISIÓN (basada en evidencia): tras enriquecer las features con el
-        # mercado acoplado alemán, el test de Diebold-Mariano muestra que el
-        # LightGBM ÚNICO es SIGNIFICATIVAMENTE mejor (MAE) que el ensemble
-        # diverso (DM≈+5, p<0.001). Por tanto producción usa LightGBM. El
-        # ensemble queda cargado pero NO se usa por defecto (USE_ENSEMBLE=False).
-        if self._use_ensemble and self._ensemble is not None:
-            price_pred = self._ensemble.predict(X)
-            self.logger.info("  Usando ensemble diverso (LightGBM L2 + mediana + Huber)")
-        else:
-            price_pred = self._model.predict(X)
-            self.logger.info("  Usando LightGBM (mejor por DM test)")
+        # Predicción puntual del modelo servido (elegido en validación).
+        price_pred = self._served_predict(X)
 
-        # Quantile bands (siempre del LightGBM quantile)
+        # Bandas de los modelos de cuantiles (LightGBM quantile, train + ES en val)
         bands = {}
         for q_name, q_model in self._quantile_models.items():
             bands[q_name] = q_model.predict(X)
 
-        # ── Corrección AR (day-ahead) ──
-        # Busca los últimos residuos ANTES del rango de predicción,
-        # no los últimos del dataset (que podrían ser posteriores).
-        if self._ar_corrector is not None:
-            target_col = f"price_{self.zone}"
-            order = self._ar_corrector.best_order
-            pred_start = available[0]
-
-            # Obtener precios reales anteriores al inicio de predicción
-            past_actuals = self._feature_data[target_col].dropna()
-            past_actuals = past_actuals[past_actuals.index < pred_start]
-
-            if len(past_actuals) >= order:
-                last_ts = past_actuals.index[-order:]
-                X_past = self._prepare_X(last_ts)
-                if self._use_ensemble and self._ensemble is not None:
-                    preds_past = self._ensemble.predict(X_past)
-                else:
-                    preds_past = self._model.predict(X_past)
-                last_resids = past_actuals.loc[last_ts].values - preds_past
-            else:
-                last_resids = np.zeros(order)
-
-            # Defensa: si algún residuo es NaN (hueco/feature problemática),
-            # no propagar NaN a toda la predicción → usar 0 en su lugar.
-            if np.any(np.isnan(last_resids)):
-                self.logger.warning(
-                    "Residuos AR con NaN — se sustituyen por 0 para esta predicción."
-                )
-                last_resids = np.nan_to_num(last_resids, nan=0.0)
-
-            price_pred_raw = price_pred.copy()
-            price_pred = self._ar_corrector.correct_day_ahead(
-                price_pred, last_resids
-            )
-
-            # Ajustar bandas quantile con el mismo shift
-            shift = price_pred - price_pred_raw
+        # ── Corrección AR day-ahead, por día de entrega local ──
+        # Para cada día D solo entran residuos hasta las 23:00 de D-1, que se
+        # conocen en la subasta de las 12:00 de D-1. Las bandas se desplazan
+        # con el mismo offset antes de la calibración conformal.
+        if self._use_ar and self._ar_corrector is not None:
+            offsets = self._ar_offsets(available)
+            price_pred = price_pred + offsets
             for q_name in bands:
-                bands[q_name] = bands[q_name] + shift
+                bands[q_name] = bands[q_name] + offsets
+
+        pre_conformal = {f"{q}_preconf": v.copy() for q, v in bands.items()}
 
         # ── Conformal calibration de bandas ──
         if self._conformal is not None:
@@ -350,11 +380,20 @@ class PricePredictor:
                 timestamps=available,
             )
 
+        # ── Reordenación monótona por hora (P10 ≤ P25 ≤ P50 ≤ P75 ≤ P90) ──
+        # Los cuantiles se ajustan por separado y pueden cruzarse; se ordenan
+        # después del conformal. price_pred no cambia.
+        from src.model.conformal import sort_quantile_bands
+        pre_sort = {f"{q}_presort": v.copy() for q, v in bands.items()}
+        bands = sort_quantile_bands(bands)
+
         # Construir DataFrame de salida
         df_out = pd.DataFrame({
             "timestamp_utc": available,
             "price_pred":    price_pred,
             **{q: v for q, v in bands.items()},
+            **(pre_conformal if include_pre_conformal else {}),
+            **(pre_sort if include_pre_conformal else {}),
         })
 
         # Convertir a hora local de Copenhagen para display
@@ -461,6 +500,8 @@ class PricePredictor:
 
         X_explain = self._prepare_X(pd.DatetimeIndex([ts]))
 
+        # SHAP se calcula sobre el LightGBM de referencia (train+val), no
+        # sobre el modelo servido (que puede ser el ensemble).
         # Inicializar explainer (cacheado)
         if self._shap_explainer is None:
             self.logger.info("  Inicializando SHAP TreeExplainer (primera vez)...")
@@ -518,9 +559,9 @@ class PricePredictor:
             raise ValueError(f"Columna {target_col} no encontrada")
 
         if start is None:
-            start = "2024-10-01"
+            start = TEST_START
         if end is None:
-            end = "2024-12-31 23:00"
+            end = TEST_END
 
         df_pred = self.predict_with_bands(start=start, end=end)
         y_true  = self._feature_data.loc[
@@ -563,7 +604,34 @@ class PricePredictor:
             "data_from":      str(first_data.date()),
             "data_until":     str(last_data.date()),
             "top5_features":  self._meta.get("top5_features", []),
+            "served_model":   self._served_model,
+            "use_ar":         self._use_ar,
+            "served_label":   served_model_label(self._served_model, self._use_ar),
         }
+
+
+# ── Predicciones servidas con precio real (evaluación y métricas servidas) ────
+
+def served_predictions(zone: str, start: str = TEST_START, end: str = TEST_END,
+                       predictor: "PricePredictor" = None,
+                       include_pre_conformal: bool = False) -> pd.DataFrame:
+    """
+    Predicciones del modelo servido (predict_with_bands) entre start y end
+    (UTC) con el precio real de la tabla de features. Es la función que usan
+    evaluate.py (fila Served) y scripts/gen_served_metrics.py, de modo que
+    las dos cifras salen de la misma ruta de código.
+
+    Returns:
+        DataFrame indexado por timestamp_utc con price_pred, bandas y
+        price_actual (solo horas con precio real).
+    """
+    predictor = predictor or PricePredictor(zone=zone)
+    df = predictor.predict_with_bands(start=start, end=end,
+                                      include_pre_conformal=include_pre_conformal)
+    df = df.set_index("timestamp_utc")
+    df.index = pd.DatetimeIndex(df.index).tz_convert("UTC")
+    df["price_actual"] = predictor._feature_data[f"price_{zone}"].reindex(df.index)
+    return df.dropna(subset=["price_actual", "price_pred"])
 
 
 # ── Función de conveniencia (API funcional) ───────────────────────────────────
@@ -588,7 +656,7 @@ def predict_day_ahead(zone: str = "DK1",
     API funcional de alto nivel. Predice un día completo con bandas.
 
     Args:
-        zone: 'DK1' o 'DK2'
+        zone: 'DK1', 'DK2' o 'FI'
         date: 'YYYY-MM-DD' (None → último día disponible)
 
     Returns:
@@ -604,7 +672,7 @@ def predict_day_ahead(zone: str = "DK1",
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Predicción de precios eléctricos")
-    parser.add_argument("--zone",    default="DK1", choices=["DK1", "DK2"])
+    parser.add_argument("--zone",    default="DK1", choices=["DK1", "DK2", "FI"])
     parser.add_argument("--date",    default=None,
                         help="Fecha a predecir YYYY-MM-DD (default: último disponible)")
     parser.add_argument("--hours",   type=int, default=24,

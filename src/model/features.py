@@ -20,9 +20,25 @@ One-hot encoding crearía 24 columnas para hora, 7 para día semana, 12 para mes
 La codificación cíclica preserva la continuidad temporal (hora 23 ≈ hora 0)
 y solo necesita 2 columnas por variable.
 
-DECISIÓN TÉCNICA: Los lags se calculan con shift() estricto.
-Nunca se usan valores del mismo timestamp o posteriores — data leakage cero.
-El shift(24) garantiza que solo vemos el precio de 24h atrás o más.
+DECISIÓN TÉCNICA: Reglas anti-fuga. Cada feature de la hora h del día de
+entrega D tiene que conocerse en la subasta day-ahead (cierre 12:00 CET de D-1):
+  - Precios (propios y de zonas vecinas): lag >= 24 h. Los precios de todas las
+    horas de D-1 se casaron en la subasta de D-2, así que ya se conocen.
+  - Magnitudes realizadas (flujos físicos, utilización de NTC) y materias
+    primas (cierre diario de TTF y CO2): lag >= 48 h, o un valor conocido a las
+    11:00 CET de D-1. Con 24 h, la hora h de D vería el flujo real o el cierre
+    de mercado de D-1, que llegan después de la subasta.
+  - Previsiones day-ahead (carga, eólica, solar, meteo): la del propio
+    instante, con la limitación de disponibilidad que explica el README. Las
+    previsiones de Fingrid cubren el día finlandés: su primera hora (la última
+    hora CET de D) se sustituye por la hora anterior (ver add_fingrid_features).
+  - Embalses (dato semanal): lag de RESERVOIR_LAG horas (13 días), el mínimo
+    que cubre el plazo de publicación (ver add_hydro_features).
+  - Umbrales, normalizaciones (percentiles, normal estacional de embalses) y
+    valores de relleno: calculados solo con el tramo de entrenamiento
+    (filas <= TRAIN_END).
+Nunca se usan valores del mismo timestamp o posteriores de magnitudes que se
+fijan en la propia subasta.
 
 Uso:
     python src/model/features.py
@@ -38,6 +54,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from src.utils.logger import get_logger, save_run_metadata
+from src.model.config import DELIVERY_TZ, TRAIN_END
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 
@@ -69,6 +86,60 @@ ROLLING_WINDOWS = [24, 48, 168]
 
 # Umbral de congestión para flag (EUR/MWh)
 CONGESTION_THRESHOLD = 10.0
+
+# Lag de las magnitudes realizadas y de las materias primas (horas). Ver las
+# reglas anti-fuga del docstring del módulo.
+REALISED_LAG = 48
+
+# Lag de los niveles de embalses (horas). El valor semanal de ENTSO-E lleva la
+# marca de inicio de su semana (lunes 00:00 CET) y el master lo propaga hacia
+# delante, así que la semana W ocupa sus propias horas. El Reglamento (UE)
+# 543/2013, art. 16.2(d), da de plazo para publicarlo hasta el tercer día
+# laborable después de la semana: el viernes de W+1 como tarde con hasta dos
+# festivos entre semana. Con 312 h (13 días) la semana W entra por primera vez
+# el domingo de W+1, cuya subasta cierra el sábado de W+1 a las 12:00 CET, ya
+# pasado el plazo. Con 168 h (una semana) el lunes de W+1 vería la semana W
+# antes de que acabe. Un lag de 14 días solo añadiría el margen del sábado a
+# mediodía al domingo a mediodía, que no es día laborable.
+RESERVOIR_LAG = 312
+RESERVOIR_LAG_TAG = f"lag{RESERVOIR_LAG // 24}d"
+
+# Las previsiones day-ahead de Fingrid (datasets 165, 246, 247 y 372) se
+# publican el día anterior a las 12:00 hora finlandesa (11:00 CET; la 372, a
+# las 10:00) para el día finlandés siguiente, de 00:00 a 24:00 hora finlandesa.
+# La última hora CET del día de entrega D (de 00:00 a 01:00 hora finlandesa de
+# D+1) sale de la previsión publicada el propio día D, después de la subasta.
+FINGRID_FC_COLS = ("fingrid_FI_load_fc_mw", "fingrid_FI_wind_fc_mw",
+                   "fingrid_FI_solar_fc_mw", "fingrid_FI_ol3_fc_mw")
+
+
+def _train_rows(df: pd.DataFrame) -> pd.Series:
+    """Máscara de las filas del tramo de entrenamiento (<= TRAIN_END, UTC)."""
+    idx = pd.to_datetime(df.index, utc=True)
+    return pd.Series(idx <= pd.Timestamp(TRAIN_END, tz="UTC"), index=df.index)
+
+
+def _train_quantile(series: pd.Series, q: float) -> float:
+    """Percentil calculado solo con las filas de entrenamiento."""
+    return float(series[_train_rows(series.to_frame())].quantile(q))
+
+
+def _fingrid_known_at_auction(series: pd.Series) -> pd.Series:
+    """Previsión de Fingrid tal como se conoce en la subasta del día CET.
+
+    Las horas cuyo día finlandés es posterior a su día de entrega CET (la
+    última hora CET de cada día, de 00:00 a 01:00 hora finlandesa) toman el
+    valor de la hora anterior de la misma serie, que es la última hora de la
+    previsión publicada antes de la subasta. Si esa hora falta, queda NaN.
+    """
+    idx = pd.to_datetime(series.index, utc=True)
+    fi_day = idx.tz_convert("Europe/Helsinki").tz_localize(None).normalize()
+    cet_day = idx.tz_convert(DELIVERY_TZ).tz_localize(None).normalize()
+    late = np.asarray(fi_day > cet_day)
+    prev = pd.Series(series.to_numpy(), index=idx).shift(freq="1h").reindex(idx)
+    out = series.copy()
+    out[late] = prev.to_numpy()[late]
+    return out
 
 
 def add_cyclical_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -214,7 +285,9 @@ def add_physical_features(df: pd.DataFrame, logger) -> pd.DataFrame:
 
         # C1. Residual Load
         if load_fc_col:
-            load_val = df[load_fc_col].fillna(df[load_fc_col].median())
+            # Relleno con la mediana de las filas de entrenamiento
+            load_fill = df.loc[_train_rows(df), load_fc_col].median()
+            load_val = df[load_fc_col].fillna(load_fill)
             df[f"feat_{zone}_residual_load"] = load_val - wind_total - solar_val
             df[f"feat_{zone}_wind_penetration"] = wind_total / load_val.replace(0, np.nan)
             logger.info(f"    {zone}: residual_load + wind_penetration OK")
@@ -334,7 +407,9 @@ def add_market_features(df: pd.DataFrame, logger) -> pd.DataFrame:
         if flow_col and ntc_col:
             utilization = (df[flow_col].abs() / df[ntc_col].replace(0, np.nan)).clip(0, 1)
             tag = flow_prefix.replace("flow_", "")
-            df[f"feat_ntc_utilization_{tag}"] = utilization.shift(24)
+            # Flujo real: los de D-1 después de las 12:00 no se conocen en la
+            # subasta, así que se usa el de D-2 (48 h).
+            df[f"feat_ntc_utilization_{tag}"] = utilization.shift(REALISED_LAG)
 
     n_mkt = len([c for c in df.columns if c.startswith("feat_spread_") or
                  c.startswith("feat_congested_") or c.startswith("feat_ntc_")])
@@ -597,36 +672,42 @@ def add_commodity_features(df: pd.DataFrame, logger) -> pd.DataFrame:
     if gas_margin_col:
         logger.info(f"    Gas marginal: {gas_margin_col}")
 
-    # H1. Gas TTF con lag 24h (day-ahead context)
-    df["feat_ttf_lag24h"] = df[ttf_col].shift(24)
+    # El cierre diario de TTF y CO2 va fechado al día de la barra y se
+    # propaga a sus horas; el cierre de D-1 llega por la tarde de D-1, después
+    # de la subasta. Con 48 h la hora h de D ve el cierre de D-2, que sí se
+    # conoce a las 12:00 de D-1.
+    lag = REALISED_LAG
+
+    # H1. Gas TTF con lag 48h
+    df["feat_ttf_lag48h"] = df[ttf_col].shift(lag)
 
     # H2. Gas TTF momentum (cambio 7 dias)
-    df["feat_ttf_7d_change"] = df[ttf_col].shift(24) - df[ttf_col].shift(24 + 168)
+    df["feat_ttf_7d_change"] = df[ttf_col].shift(lag) - df[ttf_col].shift(lag + 168)
 
     # H3. Gas TTF rolling mean 7d (tendencia)
-    df["feat_ttf_roll_mean_7d"] = df[ttf_col].shift(24).rolling(168).mean()
+    df["feat_ttf_roll_mean_7d"] = df[ttf_col].shift(lag).rolling(168).mean()
 
-    # H4. Coste marginal termico lag 24h
+    # H4. Coste marginal termico lag 48h
     if gas_margin_col:
-        df["feat_gas_marginal_lag24h"] = df[gas_margin_col].shift(24)
+        df["feat_gas_marginal_lag48h"] = df[gas_margin_col].shift(lag)
     elif ttf_col:
         # Calcular directamente si no existe la columna
-        df["feat_gas_marginal_lag24h"] = df[ttf_col].shift(24) / 0.55  # Eficiencia CCGT
+        df["feat_gas_marginal_lag48h"] = df[ttf_col].shift(lag) / 0.55  # Eficiencia CCGT
 
     # H5. Coste marginal termico completo (gas + CO2)
     if thermal_col:
-        df["feat_thermal_marginal_lag24h"] = df[thermal_col].shift(24)
+        df["feat_thermal_marginal_lag48h"] = df[thermal_col].shift(lag)
 
-    # H6. CO2 lag 24h
+    # H6. CO2 lag 48h
     if co2_col:
-        df["feat_co2_lag24h"] = df[co2_col].shift(24)
+        df["feat_co2_lag48h"] = df[co2_col].shift(lag)
 
-    # H7. Spark spread estimado = precio electrico lag24h - coste gas lag24h
+    # H7. Spark spread estimado = precio electrico lag24h - coste gas lag48h
     # Indica si las centrales de gas estan ganando dinero (spread positivo)
     # o perdiendo (spread negativo = probablemente apagadas)
     for zone in ["DK1", "DK2"]:
         price_col = f"price_{zone}"
-        margin_feat = "feat_gas_marginal_lag24h"
+        margin_feat = "feat_gas_marginal_lag48h"
         if price_col in df.columns and margin_feat in df.columns:
             df[f"feat_{zone}_spark_spread"] = (
                 df[price_col].shift(24) - df[margin_feat]
@@ -635,11 +716,11 @@ def add_commodity_features(df: pd.DataFrame, logger) -> pd.DataFrame:
     # H8. Ratio precio/gas — cuantas veces el precio electrico supera al gas
     # Valores > 2 indican que el gas fija precio con margen alto
     # Valores < 1 indican renovable dominando o precios negativos
-    if "feat_ttf_lag24h" in df.columns:
+    if "feat_ttf_lag48h" in df.columns:
         for zone in ["DK1", "DK2"]:
             price_col = f"price_{zone}"
             if price_col in df.columns:
-                ttf_safe = df["feat_ttf_lag24h"].replace(0, np.nan)
+                ttf_safe = df["feat_ttf_lag48h"].replace(0, np.nan)
                 df[f"feat_{zone}_price_gas_ratio"] = df[price_col].shift(24) / ttf_safe
 
     n_after = len([c for c in df.columns if c.startswith("feat_")])
@@ -662,8 +743,12 @@ def add_remit_features(df: pd.DataFrame, logger) -> pd.DataFrame:
     2. Cambios bruscos en indisponibilidad (nueva parada = shock de precio)
     3. Indisponibilidad total nordica agregada
 
-    Los valores NO se aplican con lag (la indisponibilidad es publica
-    en tiempo real via REMIT y ya conocida antes de la subasta day-ahead).
+    Los valores NO se aplican con lag: la indisponibilidad planificada se
+    publica via REMIT antes de la subasta. LIMITACION: el master agrega las
+    indisponibilidades por inicio y fin del evento, sin filtrar por la hora de
+    publicacion, asi que un evento publicado despues de las 12:00 de D-1 puede
+    entrar en las horas de D. scripts/leakage_sensitivity.py mide el efecto con
+    el valor conocido a las 11:00 CET de D-1.
     """
     n_before = len([c for c in df.columns if c.startswith("feat_")])
 
@@ -703,9 +788,9 @@ def add_remit_features(df: pd.DataFrame, logger) -> pd.DataFrame:
             df["feat_unavail_nordic_total"].shift(24)
         )
 
-    # I5. Flag: indisponibilidad alta (> percentil 90)
+    # I5. Flag: indisponibilidad alta (> percentil 90 del tramo de train)
     if "feat_unavail_nordic_total" in df.columns:
-        threshold = df["feat_unavail_nordic_total"].quantile(0.90)
+        threshold = _train_quantile(df["feat_unavail_nordic_total"], 0.90)
         df["feat_unavail_high"] = (
             df["feat_unavail_nordic_total"] > threshold
         ).astype(int)
@@ -726,10 +811,10 @@ def add_remit_features(df: pd.DataFrame, logger) -> pd.DataFrame:
     for zone in TARGET_ZONES:
         wind_col = f"feat_{zone}_wind_total_fc"
         if wind_col in df.columns and "feat_unavail_nordic_total" in df.columns:
-            # Normalizar ambos a [0, 1] approx
-            wind_q95 = max(df[wind_col].quantile(0.95), 1)
+            # Normalizar ambos a [0, 1] approx (percentiles del tramo de train)
+            wind_q95 = max(_train_quantile(df[wind_col], 0.95), 1)
             wind_norm = df[wind_col] / wind_q95
-            unavail_q95 = max(df["feat_unavail_nordic_total"].quantile(0.95), 1)
+            unavail_q95 = max(_train_quantile(df["feat_unavail_nordic_total"], 0.95), 1)
             unavail_norm = df["feat_unavail_nordic_total"] / unavail_q95
             # Alto cuando hay MUCHA indisponibilidad Y POCO viento
             df[f"feat_{zone}_unavail_low_wind"] = unavail_norm * (1 - wind_norm.clip(0, 1))
@@ -745,10 +830,13 @@ def add_hydro_features(df: pd.DataFrame, logger) -> pd.DataFrame:
     Features de embalses hidro e intercambios programados (fuentes ENTSO-E nuevas).
 
     DECISIÓN TÉCNICA (anti-leakage):
-      - Embalses (semanal): se usan con LAG de 168h (1 semana). El nivel de la
-        semana W se publica al cierre de W, así que en la subasta del día D solo
-        es seguro usar el último nivel ya publicado (≈ semana anterior). Además
-        se añade la tendencia a 4 semanas (¿se están vaciando o llenando?).
+      - Embalses (semanal): se usan con un LAG de RESERVOIR_LAG horas (13 días).
+        El valor de la semana W se publica como tarde el tercer día laborable
+        después de W (Reglamento 543/2013, art. 16.2(d)); con 13 días, la
+        primera entrega que lo usa es el domingo de W+1, cuya subasta es
+        posterior a ese plazo (ver RESERVOIR_LAG). Además se añaden la
+        tendencia a 4 semanas (¿se están vaciando o llenando?) y la anomalía
+        frente a la normal estacional, ambas sobre el nivel con el mismo lag.
       - Intercambios programados (horario): se determinan en el mismo clearing
         day-ahead que el precio, así que se usan con LAG de 24h (el programa de
         ayer) para evitar circularidad.
@@ -760,28 +848,31 @@ def add_hydro_features(df: pd.DataFrame, logger) -> pd.DataFrame:
     res_lagged = []
     for col in res_cols:
         zone = col.replace("reservoir_", "").replace("_stored_mwh", "")
-        lagged = df[col].shift(168)                       # 1 semana
-        df[f"feat_reservoir_{zone}_lag1w"]  = lagged
-        df[f"feat_reservoir_{zone}_chg4w"]  = lagged - df[col].shift(168 + 24 * 7 * 4)
-        res_lagged.append(f"feat_reservoir_{zone}_lag1w")
+        lagged = df[col].shift(RESERVOIR_LAG)
+        df[f"feat_reservoir_{zone}_{RESERVOIR_LAG_TAG}"] = lagged
+        df[f"feat_reservoir_{zone}_chg4w"] = lagged - df[col].shift(RESERVOIR_LAG + 24 * 7 * 4)
+        res_lagged.append(f"feat_reservoir_{zone}_{RESERVOIR_LAG_TAG}")
     # Total nórdico agregado (suma de zonas con dato), ya laggeado
     if res_lagged:
-        df["feat_reservoir_nordic_total_lag1w"] = df[res_lagged].sum(axis=1, min_count=1)
-        logger.info(f"    Embalses: {len(res_cols)} zonas (lag 1 semana) + total nórdico OK")
+        df[f"feat_reservoir_nordic_total_{RESERVOIR_LAG_TAG}"] = df[res_lagged].sum(axis=1, min_count=1)
+        logger.info(f"    Embalses: {len(res_cols)} zonas (lag {RESERVOIR_LAG} h) + total nórdico OK")
 
         # ── HYDRO BALANCE: anomalía vs normal estacional (semana-del-año) ──
-        # Es EL indicador nórdico: no importa tanto el nivel absoluto como cuánto
-        # se desvía del nivel típico para esa época del año. Normal estacional =
-        # media por semana-ISO (determinista, calendario; no usa el target).
-        # NOTA: con 2 años de datos la "normal" es una estimación gruesa.
+        # No importa tanto el nivel absoluto como cuánto se desvía del nivel
+        # típico para esa época del año. Normal estacional = media del nivel
+        # laggeado por semana ISO, calculada SOLO con las filas de entrenamiento
+        # (<= TRAIN_END). Las semanas sin dato en train toman la media de train
+        # de la zona. Con menos de tres años de train es una estimación gruesa.
         week = pd.Series(
             pd.to_datetime(df.index, utc=True).isocalendar().week.astype(int).values,
             index=df.index,
         )
+        train = _train_rows(df)
         for col in res_cols:
             zone = col.replace("reservoir_", "").replace("_stored_mwh", "")
-            lagged = df[col].shift(168)
-            normal = lagged.groupby(week).transform("mean")
+            lagged = df[col].shift(RESERVOIR_LAG)
+            normal_by_week = lagged[train].groupby(week[train]).mean()
+            normal = week.map(normal_by_week).fillna(lagged[train].mean())
             df[f"feat_reservoir_{zone}_anomaly"] = lagged - normal
         # Anomalía agregada nórdica
         anom_cols = [f"feat_reservoir_{c.replace('reservoir_','').replace('_stored_mwh','')}_anomaly"
@@ -995,25 +1086,34 @@ def add_price_profile_features(df: pd.DataFrame, logger) -> pd.DataFrame:
 def add_fingrid_features(df: pd.DataFrame, logger) -> pd.DataFrame:
     """
     Features de FI a partir de las PREVISIONES day-ahead propias de Fingrid (el TSO
-    finlandés), potencialmente más precisas que las de ENTSO-E. Todas son forecasts
-    "updated once a day" (conocidas antes de la subasta) → leakage-safe, igual que
-    las forecasts de ENTSO-E que ya usamos.
+    finlandés), potencialmente más precisas que las de ENTSO-E. Se publican una vez
+    al día, el día anterior a las 12:00 hora finlandesa (la de OL3, a las 10:00),
+    para el día finlandés siguiente (00-24 hora finlandesa). En la subasta del día
+    CET D se conocen todas las horas de D menos la última (00-01 hora finlandesa de
+    D+1), que se publica el propio día D: esa hora toma el valor de la hora
+    anterior (_fingrid_known_at_auction).
 
     Fuente: src/extract/09_fingrid_fi.py. Si las columnas no existen (no se corrió el
     extractor o no hay key Fingrid), la función no hace nada — degradación elegante.
 
-    NOTA honestidad: estos datasets de Fingrid empiezan en fechas recientes, así que en
-    el periodo de entrenamiento antiguo quedan NaN (train.py los rellena con la mediana).
-    Su valor se mide después comparando MAE con/sin Fingrid; solo se conservan si ayudan.
+    NOTA: la previsión de OL3 (372) empieza el 3-ene-2025; antes queda NaN y
+    train.py la rellena con la mediana de train. La 165, la 246 y la 247 cubren
+    todo el periodo.
     """
-    load_fc  = df.get("fingrid_FI_load_fc_mw")
-    wind_fc  = df.get("fingrid_FI_wind_fc_mw")
-    solar_fc = df.get("fingrid_FI_solar_fc_mw")
-    ol3_fc   = df.get("fingrid_FI_ol3_fc_mw")
-
-    if load_fc is None and wind_fc is None and ol3_fc is None:
+    raw = {c: df.get(c) for c in FINGRID_FC_COLS}
+    if all(raw[c] is None for c in ("fingrid_FI_load_fc_mw", "fingrid_FI_wind_fc_mw",
+                                    "fingrid_FI_ol3_fc_mw")):
         logger.info("    (sin columnas Fingrid en el master — features Fingrid omitidas)")
         return df
+
+    # Valor conocido en la subasta: la última hora CET de cada día (00-01 hora
+    # finlandesa de D+1) toma la hora anterior (ver FINGRID_FC_COLS).
+    known = {c: (_fingrid_known_at_auction(s) if s is not None else None)
+             for c, s in raw.items()}
+    load_fc  = known["fingrid_FI_load_fc_mw"]
+    wind_fc  = known["fingrid_FI_wind_fc_mw"]
+    solar_fc = known["fingrid_FI_solar_fc_mw"]
+    ol3_fc   = known["fingrid_FI_ol3_fc_mw"]
 
     n_before = len([c for c in df.columns if c.startswith("feat_")])
 
@@ -1022,8 +1122,13 @@ def add_fingrid_features(df: pd.DataFrame, logger) -> pd.DataFrame:
         solar_v = solar_fc.fillna(0) if solar_fc is not None else 0
         df["feat_FI_fingrid_residual_load"] = load_fc - wind_fc.fillna(0) - solar_v
         df["feat_FI_fingrid_wind_penetration"] = wind_fc / load_fc.replace(0, np.nan)
-        # Lag 24h + cambio respecto a ayer (mismo slot)
-        df["feat_FI_fingrid_resid_load_lag24h"] = df["feat_FI_fingrid_residual_load"].shift(24)
+        # Lag 24 h (mismo slot de ayer), con la serie sin sustituir: la hora h
+        # de D-1 viene de una previsión publicada el día D-2, o el D-1 a las
+        # 11:00 CET, antes de la subasta de D.
+        raw_solar = raw["fingrid_FI_solar_fc_mw"]
+        raw_resid = (raw["fingrid_FI_load_fc_mw"] - raw["fingrid_FI_wind_fc_mw"].fillna(0)
+                     - (raw_solar.fillna(0) if raw_solar is not None else 0))
+        df["feat_FI_fingrid_resid_load_lag24h"] = raw_resid.shift(24)
 
     # F2. Previsiones crudas (la propia señal del TSO)
     if wind_fc is not None:
@@ -1051,19 +1156,22 @@ def add_fingrid_features(df: pd.DataFrame, logger) -> pd.DataFrame:
 
 # ── Funcion principal ─────────────────────────────────────────────────────────
 
-def generate_features(save: bool = True) -> pd.DataFrame:
+def generate_features(save: bool = True,
+                      df_master: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Ejecuta el pipeline completo de feature engineering.
 
     Args:
-        save: Si True, guarda el resultado en data/master/dataset_features.parquet
+        save:      Si True, guarda el resultado en data/master/dataset_features.parquet
+        df_master: Master en memoria (p. ej. una copia modificada para un
+                   análisis de sensibilidad). Si es None, se lee MASTER_PATH.
 
     Returns:
         DataFrame con todas las features generadas.
     """
     logger = get_logger("features")
 
-    if not MASTER_PATH.exists():
+    if df_master is None and not MASTER_PATH.exists():
         logger.error(
             f"Dataset maestro no encontrado: {MASTER_PATH}\n"
             "  -> Ejecuta primero el pipeline de Fase 1: python run_pipeline.py"
@@ -1071,10 +1179,10 @@ def generate_features(save: bool = True) -> pd.DataFrame:
         raise FileNotFoundError(str(MASTER_PATH))
 
     logger.info("=== FEATURE ENGINEERING — Fase 2 ===")
-    logger.info(f"Input:  {MASTER_PATH}")
-    logger.info(f"Output: {FEATURES_PATH}")
+    logger.info(f"Input:  {'master en memoria' if df_master is not None else MASTER_PATH}")
+    logger.info(f"Output: {FEATURES_PATH if save else '(sin guardar)'}")
 
-    df = pd.read_parquet(MASTER_PATH)
+    df = pd.read_parquet(MASTER_PATH) if df_master is None else df_master.copy()
     df = df.sort_index()
     n_orig_cols = len(df.columns)
     logger.info(f"Dataset maestro: {df.shape[0]:,} filas x {n_orig_cols} columnas")

@@ -1,34 +1,45 @@
 """
 train.py
 ========
-Entrenamiento del modelo predictivo — Fase 2.
+Entrenamiento de los modelos de una zona — Fase 2.
 
-Pipeline completo:
-  1. Carga dataset de features (data/master/dataset_features.parquet)
-  2. Split temporal estricto (train / val / test)
-  3. Entrena LightGBM con hiperparámetros por defecto → benchmark inicial
-  4. Optimiza hiperparámetros con Optuna (100 trials, validación bayesiana)
-  5. Entrena modelo final con mejores hiperparámetros
-  6. Walk-forward validation (expanding window, evaluación mensual)
-  7. Quantile regression: P10, P25, P50, P75, P90 (bandas de confianza)
-  8. Serializa modelos en data/models/
+Pipeline (train_zone):
+  1. Carga la tabla de features y fija el conjunto de features de la zona
+     (regla en src/model/config.py; DK 166 columnas, FI 224).
+  2. Split temporal estricto (config.py): train hasta sep-2025, validación
+     oct-dic 2025, test ene-may 2026.
+  3. Hiperparámetros: los congelados en src/model/best_params.json, o Optuna
+     (opcional, --optuna) sobre el MAE de validación.
+  4. Elección del modelo servido EN VALIDACIÓN: LightGBM de 2000 árboles
+     entrenado con train frente al ensemble diverso (train, early stopping en
+     val). Regla fijada antes de puntuar: gana el MAE de validación más bajo;
+     si la diferencia no es significativa (Diebold-Mariano HAC h=24 + HLN,
+     p >= 0.05) se sirve el ensemble.
+  5. Corrección AR day-ahead decidida FUERA DE MUESTRA en validación: dos
+     pliegues expansivos por mes de entrega (ajusta oct y puntúa nov; ajusta
+     oct-nov y puntúa dic), con offsets por día de entrega local. Se usa si
+     baja el MAE conjunto; después se ajusta con toda la validación.
+  6. Cuantiles P10-P90: entrenados con train y early stopping en validación.
+  7. Calibración conformal (adaptive, 80 %) ajustada en validación.
+  8. LightGBM de 2000 árboles con train+val: solo comparador y SHAP.
+  9. Walk-forward mensual de un LightGBM (500 árboles), descriptivo.
+ 10. Guarda modelos, metadatos y results/training_<zona>.json.
 
-DECISIÓN TÉCNICA: Split temporal estricto, nunca aleatorio.
-Un random split filtraría información futura al modelo (data leakage) y
-daría métricas falsamente optimistas. El split temporal simula la realidad:
-entrenas con datos históricos y predices el futuro.
+Este script no puntúa nada en el test: la evaluación del test es
+src/model/evaluate.py, con la misma ruta de predicción que el dashboard.
 
-  Train:      2023-01-01 → 2024-06-30  (~18 meses)
-  Validation: 2024-07-01 → 2024-09-30  (3 meses — para Optuna)
-  Test:       2024-10-01 → 2024-12-31  (3 meses — evaluación final)
+DECISIÓN TÉCNICA: split temporal estricto, nunca aleatorio. Ningún modelo
+servido ve la validación ni el test al entrenar; la validación solo se usa
+para early stopping, elección, AR y calibración.
 
 Uso:
-    python src/model/train.py               # Entrena DK1 (por defecto)
-    python src/model/train.py --zone DK2    # Entrena DK2
-    python src/model/train.py --zone DK1 --no-optuna  # Rápido, sin tuning
+    python src/model/train.py --zone DK1          # parámetros congelados
+    python src/model/train.py --zone FI --optuna  # vuelve a buscar con Optuna
+    python src/model/train.py --all
 """
 
 import sys
+import json
 import pickle
 import argparse
 import numpy as np
@@ -40,6 +51,12 @@ from datetime import datetime
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from src.utils.logger import get_logger, save_run_metadata, robust_pickle_dump
+from src.model.config import (
+    TRAIN_END, VAL_START, VAL_END, TEST_START, TEST_END, DELIVERY_TZ,
+    LGB_COMMON, FINAL_N_ESTIMATORS, BEST_PARAMS_PATH, RESULTS_DIR,
+    FEATURE_RULE, EXPECTED_N_FEATURES, RENAMED_FEATURES, SAFE_IS_FLAGS,
+    select_feature_cols,
+)
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 
@@ -47,35 +64,56 @@ FEATURES_PATH = ROOT / "data" / "master" / "dataset_features.parquet"
 MODELS_DIR    = ROOT / "data" / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Splits temporales
-TRAIN_END  = "2025-09-30 23:00"
-VAL_START  = "2025-10-01"
-VAL_END    = "2025-12-31 23:00"
-TEST_START = "2026-01-01"
-
 # Walk-forward: a partir de qué mes comienza la validación rolling
 WF_START = "2024-06-01"
+WF_N_ESTIMATORS = 500
 
 # Quantiles para predicción probabilística
 QUANTILES = [0.10, 0.25, 0.50, 0.75, 0.90]
+QUANTILE_MAX_ESTIMATORS = 1000
 
-# Optuna
+# Optuna (opcional)
 N_TRIALS        = 100
-OPTUNA_TIMEOUT  = 3600   # segundos máximos (1h) — por si va lento
+OPTUNA_TIMEOUT  = 3600   # segundos máximos (1h)
 
-# LightGBM early stopping
+# LightGBM early stopping (solo con un conjunto de parada disjunto del de ajuste)
 EARLY_STOPPING_ROUNDS = 50
+
+# Elección de modelo y AR en validación
+DM_HORIZON      = 24
+SELECTION_ALPHA = 0.05
+AR_MAX_ORDER    = 3
+AR_MIN_SCORE_HOURS = 24 * 7   # meses de entrega con menos horas no se puntúan
+CONFORMAL_TARGET = 0.80
 
 
 # ── Preparación de datos ──────────────────────────────────────────────────────
 
-def load_and_prepare(zone: str, logger) -> tuple:
+def _split_masks(index: pd.DatetimeIndex) -> dict:
+    train = index <= pd.Timestamp(TRAIN_END, tz="UTC")
+    val = ((index >= pd.Timestamp(VAL_START, tz="UTC"))
+           & (index <= pd.Timestamp(VAL_END, tz="UTC")))
+    test = ((index >= pd.Timestamp(TEST_START, tz="UTC"))
+            & (index <= pd.Timestamp(TEST_END, tz="UTC")))
+    return {"train": train, "val": val, "test": test}
+
+
+def load_and_prepare(zone: str, logger, strict: bool = False) -> tuple:
     """
     Carga el dataset de features y prepara X, y para la zona indicada.
 
+    Conjunto de features (config.select_feature_cols): columnas feat_* (en DK,
+    sin el bloque de acoplamiento finlandés) más is_weekend / is_holiday*.
+    Los NaN se rellenan con la mediana del tramo de train, en todas las
+    particiones.
+
+    Args:
+        strict: exige el número de features publicado (EXPECTED_N_FEATURES).
+
     Returns:
-        (df_full, X, y, feature_cols, splits)
-        donde splits = dict con índices de train/val/test
+        (df_full, X, y, feature_cols, splits, fill_values)
+        splits = dict de máscaras booleanas train / val / test;
+        fill_values = dict {columna: mediana de train}.
     """
     if not FEATURES_PATH.exists():
         raise FileNotFoundError(
@@ -94,71 +132,104 @@ def load_and_prepare(zone: str, logger) -> tuple:
             f"{[c for c in df.columns if c.startswith('price_')]}"
         )
 
-    # Feature columns: solo las que empiezan por 'feat_' + flags de calendario.
-    # DECISIÓN: Excluir otros precios como features directas para evitar
-    # data leakage entre zonas (el modelo no conocería price_NO2 en producción
-    # porque se predice simultáneamente). Se incluyen los lags ya calculados.
-    #
     # ANTI-LEAKAGE: los flags `is_congested_*` del master se calculan con el
     # spread de precio del MISMO timestamp (integration.py:step_derived_features),
-    # que NO se conoce a las 12:00 del día anterior en la subasta day-ahead.
-    # Se excluyen. Sus equivalentes causales ya existen como `feat_congested_*`
-    # (spread con shift(24)). Solo se admiten flags de calendario deterministas.
-    SAFE_IS_FLAGS = ("is_weekend", "is_holiday")
+    # que NO se conoce a las 12:00 del día anterior. Se excluyen; sus equivalentes
+    # causales son `feat_congested_*` (spread con shift(24)). Solo se admiten
+    # flags de calendario deterministas.
     leaky_flags = [c for c in df.columns
                    if c.startswith("is_") and not c.startswith(SAFE_IS_FLAGS)]
     if leaky_flags:
         logger.info(f"  Excluidas {len(leaky_flags)} flags con leakage temporal: {leaky_flags}")
-    feature_cols = (
-        [c for c in df.columns if c.startswith("feat_")] +
-        [c for c in df.columns if c.startswith("is_") and c.startswith(SAFE_IS_FLAGS)]
-    )
+    feature_cols = select_feature_cols(df.columns, zone)
+    logger.info(f"  Features {zone}: {len(feature_cols)} ({FEATURE_RULE[zone]})")
+    if strict and len(feature_cols) != EXPECTED_N_FEATURES[zone]:
+        raise ValueError(
+            f"{zone}: la regla de features da {len(feature_cols)} columnas, "
+            f"se esperaban {EXPECTED_N_FEATURES[zone]}"
+        )
 
     # Eliminar filas donde el target es NaN
     df_model = df[[target_col] + feature_cols].dropna(subset=[target_col])
 
-    # Eliminar filas donde TODAS las features son NaN (primeras horas por lags)
+    # Eliminar filas donde casi todas las features son NaN (primeras horas por lags)
     min_feat_required = int(len(feature_cols) * 0.5)
     df_model = df_model.dropna(thresh=min_feat_required + 1)
 
-    # Rellenar NaN residuales en features con mediana (conservador)
-    for col in feature_cols:
-        if df_model[col].isna().any():
-            df_model[col] = df_model[col].fillna(df_model[col].median())
+    splits = _split_masks(df_model.index)
 
+    # Rellenar NaN residuales con la mediana del tramo de TRAIN (nunca de val/test)
+    medians = df_model.loc[splits["train"], feature_cols].median()
+    fill_values = {c: float(v) for c, v in medians.items()}
+    X = df_model[feature_cols].fillna(medians)
     y = df_model[target_col]
-    X = df_model[feature_cols]
-
-    # Splits temporales
-    train_mask = X.index <= pd.Timestamp(TRAIN_END, tz="UTC")
-    val_mask   = (X.index >= pd.Timestamp(VAL_START, tz="UTC")) & \
-                 (X.index <= pd.Timestamp(VAL_END, tz="UTC"))
-    test_mask  = X.index >= pd.Timestamp(TEST_START, tz="UTC")
-
-    splits = {
-        "train": train_mask,
-        "val":   val_mask,
-        "test":  test_mask,
-    }
 
     logger.info(f"  Dataset:    {len(df_model):,} filas × {len(feature_cols)} features")
-    logger.info(f"  Train:      {train_mask.sum():,} horas  "
-                f"({X[train_mask].index.min().date()} → {X[train_mask].index.max().date()})")
-    logger.info(f"  Validation: {val_mask.sum():,} horas  "
-                f"({X[val_mask].index.min().date()} → {X[val_mask].index.max().date()})")
-    logger.info(f"  Test:       {test_mask.sum():,} horas  "
-                f"({X[test_mask].index.min().date()} → {X[test_mask].index.max().date()})")
+    for name in ("train", "val", "test"):
+        m = splits[name]
+        if m.any():
+            logger.info(f"  {name:<10s}: {m.sum():,} horas  "
+                        f"({X[m].index.min().date()} → {X[m].index.max().date()})")
 
-    return df, X, y, feature_cols, splits
+    return df, X, y, feature_cols, splits, fill_values
 
 
-# ── Entrenamiento LightGBM base ───────────────────────────────────────────────
+def check_feature_set_against_saved_meta(zone: str, feature_cols: list, logger,
+                                         models_dir: Path = None) -> None:
+    """
+    Antes de sobrescribir los modelos: el conjunto de features (y su orden)
+    tiene que coincidir con el del modelo guardado, salvo los renombrados de
+    config.RENAMED_FEATURES. Lanza RuntimeError si no coincide.
+    """
+    meta_path = (models_dir or MODELS_DIR) / f"model_meta_{zone}.pkl"
+    if not meta_path.exists():
+        logger.info(f"  (sin {meta_path.name}: no hay conjunto previo que comprobar)")
+        return
+    with open(meta_path, "rb") as f:
+        saved = pickle.load(f)["feature_cols"]
+    saved = [RENAMED_FEATURES.get(c, c) for c in saved]
+    if saved != list(feature_cols):
+        missing = [c for c in saved if c not in feature_cols]
+        extra = [c for c in feature_cols if c not in saved]
+        raise RuntimeError(
+            f"{zone}: el conjunto de features no coincide con {meta_path.name} "
+            f"(faltan {missing[:5]}, sobran {extra[:5]}, "
+            f"mismo conjunto en otro orden: {not missing and not extra})"
+        )
+    logger.info(f"  Conjunto de features idéntico al de {meta_path.name} "
+                f"({len(saved)} columnas, mismo orden)")
+
+
+def load_best_params(zone: str, path: Path = BEST_PARAMS_PATH) -> dict:
+    """Hiperparámetros congelados de Optuna para la zona (best_params.json)."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return dict(data["zones"][zone]["params"])
+
+
+# ── Modelos LightGBM ──────────────────────────────────────────────────────────
+
+def _point_params(best_params: dict, n_estimators: int) -> dict:
+    params = {"objective": "regression", "metric": "mae", **LGB_COMMON}
+    params.update({k: v for k, v in best_params.items() if k != "n_estimators"})
+    params["n_estimators"] = int(n_estimators)
+    return params
+
+
+def fit_lgbm_fixed(X: pd.DataFrame, y: pd.Series, best_params: dict,
+                   n_estimators: int = FINAL_N_ESTIMATORS):
+    """LightGBM puntual con un número de árboles fijo (sin eval_set ni early stopping)."""
+    import lightgbm as lgb
+    model = lgb.LGBMRegressor(**_point_params(best_params, n_estimators))
+    model.fit(X, y)
+    return model
+
 
 def train_lgbm_default(X: pd.DataFrame, y: pd.Series,
-                       splits: dict, logger) -> object:
+                       splits: dict, logger) -> tuple:
     """
-    Entrena LightGBM con hiperparámetros por defecto.
-    Sirve como benchmark antes del tuning con Optuna.
+    LightGBM con hiperparámetros por defecto, train con early stopping en
+    validación (disjuntos). Solo referencia en el log y en training_<zona>.json.
     """
     import lightgbm as lgb
 
@@ -174,9 +245,7 @@ def train_lgbm_default(X: pd.DataFrame, y: pd.Series,
         "min_child_samples": 30,
         "subsample":        0.8,
         "colsample_bytree": 0.8,
-        "random_state":     42,
-        "n_jobs":           -1,
-        "verbose":          -1,
+        **LGB_COMMON,
     }
 
     model = lgb.LGBMRegressor(**params_default)
@@ -190,27 +259,18 @@ def train_lgbm_default(X: pd.DataFrame, y: pd.Series,
     )
 
     preds_val = model.predict(X_val)
-    mae_val   = np.mean(np.abs(y_val.values - preds_val))
+    mae_val   = float(np.mean(np.abs(y_val.values - preds_val)))
     logger.info(f"  LightGBM default → MAE val: {mae_val:.3f} EUR/MWh "
-                f"| n_estimators efectivos: {model.best_iteration_}")
-
+                f"| árboles (early stopping en val): {model.best_iteration_}")
     return model, mae_val
 
 
-# ── Optimización Optuna ───────────────────────────────────────────────────────
-
 def optimize_with_optuna(X: pd.DataFrame, y: pd.Series,
-                         splits: dict, n_trials: int, logger) -> dict:
+                         splits: dict, n_trials: int, logger) -> tuple:
     """
-    Optimización bayesiana de hiperparámetros con Optuna.
-
-    DECISIÓN TÉCNICA: Optuna usa TPE (Tree-structured Parzen Estimator)
-    que es más eficiente que grid search o random search. Con 100 trials
-    y early stopping por árbol, el tiempo total es ~30-60 minutos.
-
-    DECISIÓN: Optimizar sobre MAE en el set de validación (2024-Q3).
-    MAE es la métrica principal porque es intuitiva para el usuario
-    (error en EUR/MWh) y no está sesgada por outliers como RMSE.
+    Optimización bayesiana (TPE) de hiperparámetros sobre el MAE de validación
+    (oct-dic 2025), con LightGBM entrenado en train y early stopping en val.
+    Opcional: por defecto train_zone usa best_params.json.
     """
     try:
         import optuna
@@ -236,9 +296,7 @@ def optimize_with_optuna(X: pd.DataFrame, y: pd.Series,
             "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.6, 1.0),
             "reg_alpha":         trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
             "reg_lambda":        trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
-            "random_state":      42,
-            "n_jobs":            -1,
-            "verbose":           -1,
+            **LGB_COMMON,
         }
 
         model = lgb.LGBMRegressor(**params)
@@ -250,7 +308,6 @@ def optimize_with_optuna(X: pd.DataFrame, y: pd.Series,
                 lgb.log_evaluation(period=-1),
             ],
         )
-
         preds = model.predict(X_val)
         return np.mean(np.abs(y_val.values - preds))
 
@@ -262,50 +319,138 @@ def optimize_with_optuna(X: pd.DataFrame, y: pd.Series,
 
     best_params = study.best_params
     best_mae    = study.best_value
-
-    logger.info(f"  OK Optuna completado: MAE óptimo = {best_mae:.3f} EUR/MWh")
-    logger.info(f"  Mejores hiperparámetros:")
+    logger.info(f"  OK Optuna completado: MAE val óptimo = {best_mae:.3f} EUR/MWh")
     for k, v in best_params.items():
         logger.info(f"    {k:25s}: {v}")
-
     return best_params, best_mae
 
 
-def train_lgbm_tuned(X: pd.DataFrame, y: pd.Series,
-                     splits: dict, best_params: dict, logger) -> object:
+def train_lgbm_tuned(X: pd.DataFrame, y: pd.Series, splits: dict,
+                     best_params: dict, logger,
+                     n_estimators: int = FINAL_N_ESTIMATORS):
     """
-    Entrena el modelo final con los hiperparámetros optimizados.
-    Entrena sobre train + val (todo lo anterior al test).
+    LightGBM de referencia con train+val y un número de árboles FIJO
+    (declarado como hiperparámetro). No hay eval_set: el trimestre de
+    validación forma parte de los datos de ajuste y no puede parar nada.
+    Es comparador y base de SHAP / importancia, no el modelo servido.
     """
-    import lightgbm as lgb
-
-    # Para el modelo final: entrenar con train+val juntos
     trainval_mask = splits["train"] | splits["val"]
-    X_tv, y_tv    = X[trainval_mask], y[trainval_mask]
-    X_val, y_val  = X[splits["val"]],  y[splits["val"]]
+    model = fit_lgbm_fixed(X[trainval_mask], y[trainval_mask], best_params, n_estimators)
+    logger.info(f"  LightGBM train+val: {model.booster_.num_trees()} árboles (fijo, sin early stopping)")
+    return model
 
-    final_params = {
-        "objective":    "regression",
-        "metric":       "mae",
-        "n_estimators": 2000,
-        "random_state": 42,
-        "n_jobs":       -1,
-        "verbose":      -1,
-        **best_params,
+
+# ── Elección del modelo servido en validación ─────────────────────────────────
+
+def choose_served_model(y_val, pred_ens, pred_lgbm,
+                        alpha: float = SELECTION_ALPHA, h: int = DM_HORIZON) -> dict:
+    """
+    Regla fijada antes de puntuar: gana el MAE de validación más bajo; si el
+    LightGBM es mejor pero la diferencia no es significativa (DM HAC + HLN,
+    p >= alpha), se sirve el ensemble.
+
+    DM < 0 significa que el ensemble es mejor que el LightGBM.
+    """
+    from src.model.dm import diebold_mariano
+    y = np.asarray(y_val, float)
+    e_ens = y - np.asarray(pred_ens, float)
+    e_lgb = y - np.asarray(pred_lgbm, float)
+    mae_ens = float(np.mean(np.abs(e_ens)))
+    mae_lgb = float(np.mean(np.abs(e_lgb)))
+    dm, p = diebold_mariano(e_ens, e_lgb, loss="mae", h=h)
+    if mae_ens <= mae_lgb:
+        served, reason = "ensemble", "lower validation MAE"
+    elif p < alpha:
+        served, reason = "lightgbm", f"lower validation MAE and DM p < {alpha}"
+    else:
+        served, reason = "ensemble", (f"LightGBM has the lower validation MAE but "
+                                      f"DM p >= {alpha}, so the ensemble is kept")
+    return {
+        "rule": ("lowest validation MAE wins; if LightGBM wins without DM "
+                 f"significance (HAC h={h}, HLN, p >= {alpha}) the ensemble is served"),
+        "MAE_val_ensemble": mae_ens,
+        "MAE_val_lightgbm_train": mae_lgb,
+        "DM_ensemble_vs_lightgbm": dm,
+        "DM_p_value": p,
+        "DM_convention": "DM < 0 means the ensemble is more accurate",
+        "n_val_hours": int(len(y)),
+        "served_model": served,
+        "reason": reason,
     }
 
-    model = lgb.LGBMRegressor(**final_params)
-    model.fit(
-        X_tv, y_tv,
-        eval_set=[(X_val, y_val)],
-        callbacks=[
-            lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
-            lgb.log_evaluation(period=-1),
-        ],
-    )
 
-    logger.info(f"  Modelo tuned: n_estimators efectivos = {model.best_iteration_}")
-    return model
+def decide_ar_on_val(y_val: pd.Series, pred_val, logger=None,
+                     max_order: int = AR_MAX_ORDER,
+                     min_score_hours: int = AR_MIN_SCORE_HOURS) -> dict:
+    """
+    Decide la corrección AR day-ahead con residuos de validación FUERA DE
+    MUESTRA: pliegues expansivos por mes de entrega local. Para cada mes m
+    (salvo el primero) se ajusta el AR con los meses anteriores y se puntúa m
+    con day_ahead_offsets (solo residuos de días de entrega anteriores).
+    use_ar = el MAE conjunto de los meses puntuados baja con el AR.
+    Después se ajusta el AR con toda la validación (corrector final).
+
+    Returns:
+        dict con los pliegues, la decisión y el corrector final ('corrector').
+    """
+    from src.model.ar_correction import ARResidualCorrector, day_ahead_offsets
+
+    idx = pd.DatetimeIndex(y_val.index)
+    y = y_val.to_numpy(dtype=float)
+    pred = np.asarray(pred_val, dtype=float)
+    resid = pd.Series(y - pred, index=idx)
+    local = idx.tz_convert(DELIVERY_TZ)
+    month = np.asarray(local.year * 12 + local.month - 1)
+    months = sorted(set(month.tolist()))
+
+    folds, err_raw, err_ar = [], [], []
+    for i, m in enumerate(months):
+        if i == 0:
+            continue
+        score = month == m
+        if score.sum() < min_score_hours:
+            continue
+        fit = month < m
+        ar = ARResidualCorrector(max_order=max_order).fit(y[fit], pred[fit], verbose=False)
+        off = day_ahead_offsets(idx[score], resid, ar, warn=False)
+        e_raw = np.abs(y[score] - pred[score])
+        e_ar = np.abs(y[score] - (pred[score] + off))
+        err_raw.append(e_raw)
+        err_ar.append(e_ar)
+        folds.append({
+            "fit_months": [f"{mm // 12}-{mm % 12 + 1:02d}" for mm in months if mm < m],
+            "score_month": f"{m // 12}-{m % 12 + 1:02d}",
+            "n_fit_hours": int(fit.sum()),
+            "n_scored_hours": int(score.sum()),
+            "ar_order": int(ar.best_order),
+            "MAE_raw": float(e_raw.mean()),
+            "MAE_ar": float(e_ar.mean()),
+        })
+
+    if not folds:
+        raise ValueError("validación demasiado corta para decidir el AR fuera de muestra")
+    mae_raw = float(np.concatenate(err_raw).mean())
+    mae_ar = float(np.concatenate(err_ar).mean())
+    use_ar = mae_ar < mae_raw
+
+    final = ARResidualCorrector(max_order=max_order).fit(y, pred, verbose=False)
+    if logger is not None:
+        for f in folds:
+            logger.info(f"    AR pliegue {f['score_month']}: MAE {f['MAE_raw']:.3f} → "
+                        f"{f['MAE_ar']:.3f} (AR({f['ar_order']}))")
+        logger.info(f"  AR fuera de muestra (val): MAE {mae_raw:.3f} → {mae_ar:.3f} "
+                    f"→ use_ar={use_ar}")
+    return {
+        "method": ("expanding folds by local delivery month inside the validation "
+                   "quarter; offsets per delivery day from residuals up to 23:00 "
+                   "of the previous day (Europe/Copenhagen)"),
+        "folds": folds,
+        "MAE_raw_scored": mae_raw,
+        "MAE_ar_scored": mae_ar,
+        "use_ar": bool(use_ar),
+        "final_fit": {"n_hours": int(len(y)), **final.get_params()},
+        "corrector": final,
+    }
 
 
 # ── Walk-forward validation ───────────────────────────────────────────────────
@@ -313,24 +458,12 @@ def train_lgbm_tuned(X: pd.DataFrame, y: pd.Series,
 def walk_forward_validation(X: pd.DataFrame, y: pd.Series,
                             best_params: dict, logger) -> pd.DataFrame:
     """
-    Walk-forward validation con ventana expandible — evaluación mensual.
-    Incluye corrección AR para mostrar el beneficio combinado.
-
-    DECISIÓN TÉCNICA: Es más informativa que un único split train/test.
-    Muestra cómo evoluciona el rendimiento del modelo a medida que
-    tiene más datos de entrenamiento, y detecta si hay degradación
-    temporal (el modelo empeora en periodos específicos del año).
-
-    Esquema:
-      Ene-Jun 2023 → predice Jul 2023
-      Ene-Jul 2023 → predice Ago 2023
-      ...
-      Ene-Sep 2024 → predice Oct 2024
-      ...
+    Walk-forward mensual con ventana expandible de un LightGBM de
+    WF_N_ESTIMATORS árboles. Descriptivo: mide la estabilidad del LightGBM a
+    lo largo del tiempo; no es el modelo servido y no decide nada.
     """
     import lightgbm as lgb
     from sklearn.metrics import mean_absolute_error
-    from src.model.ar_correction import ARResidualCorrector
 
     logger.info("\n  Walk-forward validation (expanding window)...")
 
@@ -342,156 +475,105 @@ def walk_forward_validation(X: pd.DataFrame, y: pd.Series,
         predict_month_end = predict_month_start + pd.offsets.MonthEnd(1)
         predict_month_end = predict_month_end.replace(hour=23, tzinfo=predict_month_start.tzinfo)
 
-        # Train: todo antes del mes a predecir
         train_mask = X.index < predict_month_start
         pred_mask  = (X.index >= predict_month_start) & (X.index <= predict_month_end)
-
         if train_mask.sum() < 1000 or pred_mask.sum() == 0:
             continue
 
         X_tr, y_tr = X[train_mask], y[train_mask]
         X_pr, y_pr = X[pred_mask],  y[pred_mask]
 
-        # Entrenamiento rápido (sin early stopping para speed)
-        params = {
-            "objective":    "regression",
-            "metric":       "mae",
-            "n_estimators": min(500, best_params.get("n_estimators", 500)),
-            "random_state": 42,
-            "n_jobs":       -1,
-            "verbose":      -1,
-            **{k: v for k, v in best_params.items() if k != "n_estimators"},
-        }
-
-        model = lgb.LGBMRegressor(**params)
+        model = lgb.LGBMRegressor(**_point_params(best_params, WF_N_ESTIMATORS))
         model.fit(X_tr, y_tr)
 
         preds = model.predict(X_pr)
         mae   = mean_absolute_error(y_pr, preds)
         rmse  = np.sqrt(np.mean((y_pr.values - preds) ** 2))
 
-        # ── AR correction sobre residuos del train ──
-        preds_train = model.predict(X_tr)
-        ar = ARResidualCorrector(max_order=3)
-        ar.fit(y_tr.values, preds_train, verbose=False)
-        # Day-ahead: solo usa residuos conocidos (fin del train), NO residuos futuros
-        from src.model.ar_correction import simulate_day_ahead_correction
-        da_metrics = simulate_day_ahead_correction(y_pr.values, preds, ar, verbose=False)
-        mae_ar   = da_metrics["MAE_day_ahead_corrected"]
-        rmse_ar  = np.sqrt(np.mean((y_pr.values[24:] - preds[24:]) ** 2))  # excluir 1er día sin resid
-
         results.append({
             "month":       predict_month_start.strftime("%Y-%m"),
             "n_train":     len(X_tr),
             "n_test":      len(X_pr),
             "MAE":         round(mae, 3),
-            "MAE_ar":      round(mae_ar, 3),
             "RMSE":        round(rmse, 3),
-            "RMSE_ar":     round(rmse_ar, 3),
-            "AR_improve":  round((mae - mae_ar) / mae * 100, 1),
             "price_mean":  round(y_pr.mean(), 2),
             "price_std":   round(y_pr.std(), 2),
         })
         logger.info(f"    {predict_month_start.strftime('%Y-%m')}: "
-                    f"MAE={mae:.2f} → AR={mae_ar:.2f} "
-                    f"({(mae - mae_ar) / mae * 100:+.1f}%) | "
-                    f"train={len(X_tr):,}h")
+                    f"MAE={mae:.2f} | train={len(X_tr):,}h")
 
     df_wf = pd.DataFrame(results)
     if not df_wf.empty:
-        logger.info(f"\n  Walk-forward MAE (raw): "
-                    f"media={df_wf['MAE'].mean():.2f} | "
-                    f"std={df_wf['MAE'].std():.2f} | "
-                    f"max={df_wf['MAE'].max():.2f}")
-        logger.info(f"  Walk-forward MAE (AR):  "
-                    f"media={df_wf['MAE_ar'].mean():.2f} | "
-                    f"std={df_wf['MAE_ar'].std():.2f} | "
-                    f"max={df_wf['MAE_ar'].max():.2f}")
-        logger.info(f"  Mejora AR media: {df_wf['AR_improve'].mean():.1f}%")
+        logger.info(f"\n  Walk-forward MAE: media={df_wf['MAE'].mean():.2f} | "
+                    f"std={df_wf['MAE'].std():.2f} | max={df_wf['MAE'].max():.2f}")
     return df_wf
+
+
+def _wf_summary(df_wf: pd.DataFrame) -> dict:
+    if df_wf.empty:
+        return {}
+    out = {
+        "model": f"LightGBM, {WF_N_ESTIMATORS} trees, expanding window, retrained monthly",
+        "note": "descriptive; not the served model and not used for any choice",
+        "folds": int(len(df_wf)),
+        "first_month": str(df_wf["month"].iloc[0]),
+        "last_month": str(df_wf["month"].iloc[-1]),
+        "MAE_monthly": {"mean": float(df_wf["MAE"].mean()), "std": float(df_wf["MAE"].std()),
+                        "min": float(df_wf["MAE"].min()), "max": float(df_wf["MAE"].max())},
+    }
+    return out
 
 
 # ── Quantile Regression ───────────────────────────────────────────────────────
 
 def train_quantile_models(X: pd.DataFrame, y: pd.Series,
-                          splits: dict, best_params: dict, logger) -> dict:
+                          splits: dict, best_params: dict, logger) -> tuple:
     """
-    Entrena modelos de quantile regression para predicción probabilística.
-
-    DECISIÓN TÉCNICA: Quantile regression en lugar de intervalos basados
-    en residuos porque los residuos del modelo no son gaussianos — en
-    precios eléctricos la distribución de errores tiene colas pesadas
-    (fat tails) por los picos de precio. Los quantiles capturan esto
-    correctamente.
-
-    Modelos: P10, P25, P50, P75, P90
-    → P10-P90: intervalo de confianza del 80%
-    → P25-P75: intervalo de confianza del 50% (IQR)
-    → P50: predicción central (mediana, más robusta que media en precios)
+    Modelos de quantile regression P10, P25, P50, P75, P90, entrenados con
+    train y early stopping en validación (disjuntos). Sin reajuste con
+    train+val. La cobertura en bruto se mide en validación.
     """
     import lightgbm as lgb
 
-    logger.info("\n  Entrenando modelos de quantile regression...")
+    logger.info("\n  Entrenando modelos de quantile regression (train, ES en val)...")
+    X_tr, y_tr   = X[splits["train"]], y[splits["train"]]
+    X_val, y_val = X[splits["val"]],   y[splits["val"]]
 
-    trainval_mask = splits["train"] | splits["val"]
-    X_tv, y_tv    = X[trainval_mask], y[trainval_mask]
-    X_val, y_val  = X[splits["val"]],  y[splits["val"]]
-
-    quantile_models = {}
-
+    quantile_models, n_trees = {}, {}
     for q in QUANTILES:
         params_q = {
             "objective":    "quantile",
-            "alpha":        q,           # alpha = quantile a predecir
+            "alpha":        q,
             "metric":       "quantile",
-            "n_estimators": 1000,
-            "random_state": 42,
-            "n_jobs":       -1,
-            "verbose":      -1,
-            **{k: v for k, v in best_params.items()
-               if k not in ["n_estimators"]},
+            **LGB_COMMON,
+            **{k: v for k, v in best_params.items() if k != "n_estimators"},
+            "n_estimators": QUANTILE_MAX_ESTIMATORS,
         }
-
         model_q = lgb.LGBMRegressor(**params_q)
         model_q.fit(
-            X_tv, y_tv,
+            X_tr, y_tr,
             eval_set=[(X_val, y_val)],
             callbacks=[
                 lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
                 lgb.log_evaluation(period=-1),
             ],
         )
+        name = f"P{int(q*100):02d}"
+        quantile_models[name] = model_q
+        n_trees[name] = int(model_q.best_iteration_ or QUANTILE_MAX_ESTIMATORS)
+        logger.info(f"    {name} entrenado ({n_trees[name]} árboles)")
 
-        quantile_models[f"P{int(q*100):02d}"] = model_q
-        logger.info(f"    P{int(q*100):02d} entrenado OK")
-
-    # Verificar calibración sobre el set de test
-    logger.info("\n  Verificando calibración de intervalos (test set)...")
-    X_test = X[splits["test"]]
-    y_test = y[splits["test"]]
-
-    coverage_80 = _check_coverage(
-        y_test.values,
-        quantile_models["P10"].predict(X_test),
-        quantile_models["P90"].predict(X_test),
-        target_coverage=0.80,
-        logger=logger,
-        label="80% (P10-P90)"
-    )
-    coverage_50 = _check_coverage(
-        y_test.values,
-        quantile_models["P25"].predict(X_test),
-        quantile_models["P75"].predict(X_test),
-        target_coverage=0.50,
-        logger=logger,
-        label="50% (P25-P75)"
-    )
-
-    return quantile_models, {"coverage_80": coverage_80, "coverage_50": coverage_50}
+    logger.info("\n  Cobertura en bruto en validación (in-sample para el early stopping):")
+    cov80 = _check_coverage(y_val.values, quantile_models["P10"].predict(X_val),
+                            quantile_models["P90"].predict(X_val), 0.80, logger, "80% (P10-P90)")
+    cov50 = _check_coverage(y_val.values, quantile_models["P25"].predict(X_val),
+                            quantile_models["P75"].predict(X_val), 0.50, logger, "50% (P25-P75)")
+    return quantile_models, {"coverage_80_val_raw": cov80, "coverage_50_val_raw": cov50,
+                             "n_trees": n_trees}
 
 
 def _check_coverage(y_true, lower, upper, target_coverage, logger, label) -> float:
-    """Verifica que el intervalo contiene el valor real el % esperado de veces."""
+    """Proporción de valores reales dentro del intervalo."""
     coverage = np.mean((y_true >= lower) & (y_true <= upper))
     status   = "OK" if abs(coverage - target_coverage) < 0.05 else "WARN"
     logger.info(f"    {status} Cobertura {label}: "
@@ -501,363 +583,221 @@ def _check_coverage(y_true, lower, upper, target_coverage, logger, label) -> flo
 
 # ── Serialización ─────────────────────────────────────────────────────────────
 
-def save_models(zone: str, model_main, quantile_models: dict,
-                feature_cols: list, best_params: dict,
-                wf_results: pd.DataFrame, logger):
-    """
-    Guarda todos los modelos y metadatos asociados en data/models/.
-    """
+def save_models(zone: str, model_final, model_train, ensemble, quantile_models: dict,
+                conformal, ar_corrector, feature_cols: list, best_params: dict,
+                fill_values: dict, selection: dict, ar_block: dict,
+                top5: list, wf_results: pd.DataFrame, logger) -> dict:
+    """Guarda modelos y metadatos en data/models/."""
     ts = datetime.now().strftime("%Y%m%d_%H%M")
 
-    # Modelo principal (guardado robusto ante OneDrive/sync)
-    main_path = MODELS_DIR / f"lightgbm_{zone}.pkl"
-    robust_pickle_dump(model_main, main_path)
-    logger.info(f"  Modelo principal: {main_path}")
+    robust_pickle_dump(model_final, MODELS_DIR / f"lightgbm_{zone}.pkl")
+    robust_pickle_dump(model_train, MODELS_DIR / f"lightgbm_train_{zone}.pkl")
+    ensemble.save(str(MODELS_DIR / f"ensemble_{zone}.pkl"))
+    robust_pickle_dump(quantile_models, MODELS_DIR / f"quantile_models_{zone}.pkl")
+    conformal.save(str(MODELS_DIR / f"conformal_{zone}.pkl"))
+    ar_corrector.save(str(MODELS_DIR / f"ar_corrector_served_{zone}.pkl"))
 
-    # Modelos quantile
-    quantile_path = MODELS_DIR / f"quantile_models_{zone}.pkl"
-    robust_pickle_dump(quantile_models, quantile_path)
-    logger.info(f"  Modelos quantile: {quantile_path}")
-
-    # Metadatos del modelo (feature names, hiperparámetros, splits)
     meta = {
         "zone":          zone,
         "trained_at":    ts,
         "feature_cols":  feature_cols,
+        "feature_rule":  FEATURE_RULE[zone],
+        "n_features":    len(feature_cols),
+        "fill_values":   fill_values,
         "best_params":   best_params,
         "train_end":     TRAIN_END,
         "val_start":     VAL_START,
         "val_end":       VAL_END,
         "test_start":    TEST_START,
+        "test_end":      TEST_END,
         "quantiles":     QUANTILES,
-        "n_features":    len(feature_cols),
-        "has_ar":        True,   # Flag: corrección AR disponible
+        "served_model":  selection["served_model"],
+        "use_ar":        bool(ar_block["use_ar"]),
+        "n_estimators_final": FINAL_N_ESTIMATORS,
+        "selection":     {k: v for k, v in selection.items()},
+        "ar":            {k: v for k, v in ar_block.items() if k != "corrector"},
+        "top5_features": top5,
     }
-    meta_path = MODELS_DIR / f"model_meta_{zone}.pkl"
-    robust_pickle_dump(meta, meta_path)
+    robust_pickle_dump(meta, MODELS_DIR / f"model_meta_{zone}.pkl")
 
-    # Walk-forward results como CSV
     if not wf_results.empty:
-        wf_path = MODELS_DIR / f"walkforward_{zone}.csv"
-        wf_results.to_csv(wf_path, index=False)
-        logger.info(f"  Walk-forward results: {wf_path}")
-
-    logger.info(f"  Metadatos: {meta_path}")
+        wf_results.to_csv(MODELS_DIR / f"walkforward_{zone}.csv", index=False)
+    logger.info(f"  Modelos y metadatos guardados en data/models/ ({zone})")
+    return meta
 
 
 # ── Función principal ─────────────────────────────────────────────────────────
 
-def train_zone(zone: str = "DK1", run_optuna: bool = True,
-               n_trials: int = N_TRIALS) -> dict:
+def train_zone(zone: str = "DK1", run_optuna: bool = False,
+               n_trials: int = N_TRIALS, params_json: Path = BEST_PARAMS_PATH,
+               check_saved_features: bool = True) -> dict:
     """
-    Pipeline completo de entrenamiento para una zona.
+    Pipeline completo de entrenamiento para una zona (ver docstring del módulo).
 
     Args:
-        zone:       Zona de precio ('DK1' o 'DK2')
-        run_optuna: Si False, usa hiperparámetros razonables por defecto (más rápido)
-        n_trials:   Número de trials de Optuna
+        zone:        'DK1', 'DK2' o 'FI'
+        run_optuna:  True vuelve a buscar hiperparámetros con Optuna; False
+                     (defecto) usa los congelados de best_params.json.
+        n_trials:    trials de Optuna.
+        params_json: fichero de hiperparámetros congelados.
+        check_saved_features: exigir que el conjunto de features coincida con
+                     el del modelo guardado (salvo renombrados).
 
     Returns:
-        Dict con métricas finales del modelo.
+        Dict con las métricas de validación, la elección y la decisión AR.
     """
+    from src.model.diverse_ensemble import DiverseObjectiveEnsemble
+    from src.model.conformal import ConformalCalibrator
+    from src.model.results_io import write_json
+
     logger = get_logger(f"train_{zone}")
     logger.info(f"=== ENTRENAMIENTO MODELO — Zona {zone} ===")
-    logger.info(f"  Optuna: {'SÍ' if run_optuna else 'NO'} | Trials: {n_trials}")
+    logger.info(f"  Hiperparámetros: {'Optuna (' + str(n_trials) + ' trials)' if run_optuna else 'best_params.json'}"
+                f" | LightGBM n_jobs={LGB_COMMON['n_jobs']}")
 
-    # 1. Cargar datos
+    # 1. Datos
     logger.info("\n[1] Cargando dataset de features...")
-    df, X, y, feature_cols, splits = load_and_prepare(zone, logger)
+    df, X, y, feature_cols, splits, fill_values = load_and_prepare(zone, logger, strict=True)
+    if check_saved_features:
+        check_feature_set_against_saved_meta(zone, feature_cols, logger)
+    tr, va = splits["train"], splits["val"]
 
-    # 2. LightGBM con defaults (benchmark)
-    logger.info("\n[2] LightGBM con hiperparámetros por defecto...")
+    # 2. Referencia: LightGBM por defecto (train, early stopping en val)
+    logger.info("\n[2] LightGBM con hiperparámetros por defecto (referencia)...")
     model_default, mae_default = train_lgbm_default(X, y, splits, logger)
 
-    # 3. Optimización Optuna
+    # 3. Hiperparámetros
     if run_optuna:
         logger.info("\n[3] Optimización de hiperparámetros con Optuna...")
-        best_params, mae_optuna = optimize_with_optuna(
-            X, y, splits, n_trials, logger
-        )
-        logger.info(f"\n  Mejora Optuna vs default: "
-                    f"{mae_default:.3f} → {mae_optuna:.3f} EUR/MWh "
-                    f"({(mae_default - mae_optuna) / mae_default * 100:.1f}% reducción)")
+        best_params, mae_optuna = optimize_with_optuna(X, y, splits, n_trials, logger)
+        params_source = f"Optuna, {n_trials} trials (this run)"
     else:
-        logger.info("\n[3] Optuna omitido — usando hiperparámetros razonables...")
-        best_params = {
-            "learning_rate":     0.03,
-            "num_leaves":        95,
-            "max_depth":         9,
-            "min_child_samples": 40,
-            "subsample":         0.8,
-            "colsample_bytree":  0.75,
-            "reg_alpha":         0.1,
-            "reg_lambda":        1.0,
-        }
+        best_params = load_best_params(zone, params_json)
+        mae_optuna = None
+        params_source = "src/model/best_params.json"
+        logger.info(f"\n[3] Hiperparámetros congelados ({params_source}): {best_params}")
 
-    # 4. Modelo final con mejores hiperparámetros
-    logger.info("\n[4] Entrenando modelo final (train+val)...")
-    model_final = train_lgbm_tuned(X, y, splits, best_params, logger)
+    # 4. Elección del modelo servido en validación
+    logger.info("\n[4] Elección del modelo servido en validación...")
+    model_train = fit_lgbm_fixed(X[tr], y[tr], best_params, FINAL_N_ESTIMATORS)
+    ensemble = DiverseObjectiveEnsemble(
+        zone=zone, base_params={"n_estimators": FINAL_N_ESTIMATORS, **best_params})
+    ensemble.fit(X[tr], y[tr], X[va], y[va], verbose=True)
+    pred_val_lgbm = model_train.predict(X[va])
+    pred_val_ens = ensemble.predict(X[va])
+    selection = choose_served_model(y[va].values, pred_val_ens, pred_val_lgbm)
+    selection["ensemble_n_trees"] = {name: int(m.best_iteration_ or m.n_estimators)
+                                     for name, m in ensemble.models.items()}
+    selection["lightgbm_train_n_trees"] = int(model_train.booster_.num_trees())
+    logger.info(f"  MAE val: ensemble {selection['MAE_val_ensemble']:.3f} | "
+                f"LightGBM(train) {selection['MAE_val_lightgbm_train']:.3f} | "
+                f"DM {selection['DM_ensemble_vs_lightgbm']:+.2f} "
+                f"(p={selection['DM_p_value']:.4f}) → {selection['served_model']} "
+                f"({selection['reason']})")
+    pred_val_served = pred_val_ens if selection["served_model"] == "ensemble" else pred_val_lgbm
 
-    # 5. Evaluación en test
-    logger.info("\n[5] Evaluación en test set...")
-    X_test = X[splits["test"]]
-    y_test = y[splits["test"]]
-    preds_test = model_final.predict(X_test)
-    errors     = y_test.values - preds_test
+    # 5. Corrección AR decidida fuera de muestra en validación
+    logger.info("\n[5] Corrección AR day-ahead (decisión en validación)...")
+    ar_block = decide_ar_on_val(y[va], pred_val_served, logger)
 
-    mae_test  = float(np.mean(np.abs(errors)))
-    rmse_test = float(np.sqrt(np.mean(errors ** 2)))
-    denom     = (np.abs(y_test.values) + np.abs(preds_test)) / 2
-    smape_test = float(np.mean(np.where(denom > 0.1, np.abs(errors) / denom * 100, 0)))
-    dir_acc   = float(np.mean(np.sign(np.diff(y_test.values)) ==
-                               np.sign(np.diff(preds_test))) * 100)
-    ss_res    = np.sum(errors ** 2)
-    ss_tot    = np.sum((y_test.values - np.mean(y_test.values)) ** 2)
-    r2_test   = float(1 - ss_res / ss_tot)
+    # 6. Cuantiles (train, early stopping en val)
+    logger.info("\n[6] Quantile regression (P10-P90)...")
+    quantile_models, q_stats = train_quantile_models(X, y, splits, best_params, logger)
 
-    logger.info(f"\n  ┌─────────────────────────────────────────┐")
-    logger.info(f"  │  MÉTRICAS TEST — {zone}                   │")
-    logger.info(f"  ├─────────────────────────────────────────┤")
-    logger.info(f"  │  MAE:          {mae_test:7.3f} EUR/MWh       │")
-    logger.info(f"  │  RMSE:         {rmse_test:7.3f} EUR/MWh       │")
-    logger.info(f"  │  sMAPE:        {smape_test:7.2f} %              │")
-    logger.info(f"  │  Dir Accuracy: {dir_acc:7.2f} %              │")
-    logger.info(f"  │  R²:           {r2_test:7.4f}               │")
-    logger.info(f"  └─────────────────────────────────────────┘")
-    logger.info(f"\n  Benchmark Nord Pool: MAE 5-15 EUR/MWh | DirAcc 55-65%")
+    # 7. Conformal ajustado en validación (bandas en bruto, sin AR)
+    logger.info("\n[7] Conformal calibration en validación...")
+    q_val = {q: m.predict(X[va]) for q, m in quantile_models.items()}
+    conformal = ConformalCalibrator(strategy="adaptive", target_coverage=CONFORMAL_TARGET)
+    conformal.fit(y_cal=y[va].values, pred_cal=pred_val_served,
+                  q_lower_cal=q_val["P10"], q_upper_cal=q_val["P90"],
+                  timestamps_cal=y[va].index, verbose=False)
+    conf_diag = conformal.get_diagnostics()
+    logger.info(f"  Conformal (val, in-sample): {conf_diag['raw_coverage']:.1%} → "
+                f"{conf_diag['calibrated_coverage_insample']:.1%}")
 
-    # 6. Walk-forward validation
-    logger.info("\n[6] Walk-forward validation (expanding window)...")
+    # 8. LightGBM train+val (comparador y SHAP)
+    logger.info("\n[8] LightGBM de referencia con train+val (2000 árboles fijos)...")
+    model_final = train_lgbm_tuned(X, y, splits, best_params, logger,
+                                   n_estimators=FINAL_N_ESTIMATORS)
+
+    # 9. Walk-forward (descriptivo)
+    logger.info("\n[9] Walk-forward validation (expanding window)...")
     wf_results = walk_forward_validation(X, y, best_params, logger)
 
-    # 7. Quantile regression
-    logger.info("\n[7] Quantile regression (P10-P90)...")
-    quantile_models, coverage_stats = train_quantile_models(
-        X, y, splits, best_params, logger
-    )
-
-    # 7b. Conformal calibration — ajustar bandas para cobertura garantizada
-    from src.model.conformal import ConformalCalibrator
-    logger.info("\n[7b] Conformal calibration de bandas...")
-
-    # DECISIÓN TÉCNICA (split-conformal honesto): el set de calibración y el
-    # de medición de cobertura deben ser DISJUNTOS para que la cobertura sea
-    # out-of-sample (no in-sample, que sería optimista por construcción).
-    # Los quantile models entrenaron con train+val, así que solo el test está
-    # sin ver. Partimos el test en dos mitades temporales:
-    #   - 1ª mitad  → calibración del conformal (se guarda este calibrador)
-    #   - 2ª mitad  → medición de cobertura (out-of-sample, honesta)
-    test_index = X[splits["test"]].index
-    n_test = len(test_index)
-
-    if n_test >= 200:
-        cut       = n_test // 2
-        cal_idx   = test_index[:cut]
-        eval_idx  = test_index[cut:]
-        X_cal, y_cal = X.loc[cal_idx], y.loc[cal_idx]
-        X_ev,  y_ev  = X.loc[eval_idx], y.loc[eval_idx]
-
-        pred_cal = model_final.predict(X_cal)
-        pred_ev  = model_final.predict(X_ev)
-        qpreds_cal = {q: m.predict(X_cal) for q, m in quantile_models.items()}
-        qpreds_ev  = {q: m.predict(X_ev)  for q, m in quantile_models.items()}
-
-        conformal_cal = ConformalCalibrator(strategy="adaptive", target_coverage=0.80)
-        conformal_cal.fit(
-            y_cal=y_cal.values,
-            pred_cal=pred_cal,
-            q_lower_cal=qpreds_cal["P10"],
-            q_upper_cal=qpreds_cal["P90"],
-            timestamps_cal=y_cal.index,
-            verbose=True,
-        )
-
-        # Guardar calibrador (ajustado en la 1ª mitad del test)
-        conf_path = MODELS_DIR / f"conformal_{zone}.pkl"
-        conformal_cal.save(str(conf_path))
-        logger.info(f"  Conformal calibrator guardado: {conf_path.name}")
-
-        # Cobertura OUT-OF-SAMPLE en la 2ª mitad del test (honesta)
-        bands_adj = conformal_cal.calibrate_all_bands(
-            pred_ev, qpreds_ev, timestamps=y_ev.index
-        )
-        cov_raw = np.mean(
-            (y_ev.values >= qpreds_ev["P10"]) & (y_ev.values <= qpreds_ev["P90"])
-        )
-        cov_conf = np.mean(
-            (y_ev.values >= bands_adj["P10"]) & (y_ev.values <= bands_adj["P90"])
-        )
-        cov_50_raw = np.mean(
-            (y_ev.values >= qpreds_ev["P25"]) & (y_ev.values <= qpreds_ev["P75"])
-        )
-        cov_50_conf = np.mean(
-            (y_ev.values >= bands_adj["P25"]) & (y_ev.values <= bands_adj["P75"])
-        )
-        coverage_stats["coverage_80_conformal"] = float(cov_conf)
-        coverage_stats["coverage_50_conformal"] = float(cov_50_conf)
-        coverage_stats["conformal_eval"] = "out-of-sample (2ª mitad del test)"
-        logger.info(f"  [out-of-sample] P10-P90: {cov_raw:.1%} → {cov_conf:.1%} (target 80%)")
-        logger.info(f"  [out-of-sample] P25-P75: {cov_50_raw:.1%} → {cov_50_conf:.1%} (target 50%)")
-    else:
-        logger.warning("  WARN: Test insuficiente para split-conformal — omitiendo conformal")
-
-    # 8. Feature importance
-    logger.info("\n[8] Top 15 features por importancia (gain)...")
-    feat_imp = pd.Series(
-        model_final.feature_importances_,
-        index=feature_cols
-    ).sort_values(ascending=False)
-
+    # 10. Importancia de features (LightGBM train+val)
+    feat_imp = pd.Series(model_final.feature_importances_,
+                         index=feature_cols).sort_values(ascending=False)
+    logger.info("\n[10] Top 15 features por importancia (split):")
     for feat, imp in feat_imp.head(15).items():
-        bar = "█" * int(imp / feat_imp.max() * 20)
-        logger.info(f"  {feat:45s} {bar}")
+        logger.info(f"  {feat:45s} {'█' * int(imp / feat_imp.max() * 20)}")
+    top5 = feat_imp.head(5).index.tolist()
 
-    # ── [AR] Corrección AR de residuos ──
-    from src.model.ar_correction import ARResidualCorrector
-    logger.info("\n[AR] Ajustando Corrector Autorregresivo de Residuos...")
-    trainval_mask = splits["train"] | splits["val"]
-    preds_tv = model_final.predict(X[trainval_mask])
-    ar_corrector = ARResidualCorrector(max_order=3)
-    ar_corrector.fit(y[trainval_mask].values, preds_tv, verbose=False)
-    ar_path = MODELS_DIR / f"ar_corrector_{zone}.pkl"
-    ar_corrector.save(str(ar_path))
-    logger.info(f"  AR({ar_corrector.best_order}) → "
-                f"φ₁={ar_corrector.ar_coefs[0]:.4f} | "
-                f"Guardado: {ar_path.name}")
+    # 11. Guardar
+    logger.info("\n[11] Guardando modelos...")
+    save_models(zone, model_final, model_train, ensemble, quantile_models, conformal,
+                ar_block["corrector"], feature_cols, best_params, fill_values,
+                selection, ar_block, top5, wf_results, logger)
 
-    # Métricas test CON AR (day-ahead = solo residuos conocidos, SIN ver futuro)
-    from src.model.ar_correction import simulate_day_ahead_correction
-    da_test_metrics = simulate_day_ahead_correction(
-        y_test.values, preds_test, ar_corrector, verbose=False
-    )
-    mae_test_ar  = da_test_metrics["MAE_day_ahead_corrected"]
-    rmse_test_ar = float(np.sqrt(np.mean((y_test.values[24:] - preds_test[24:]) ** 2)))
-    logger.info(f"  Test MAE: {mae_test:.3f} → {mae_test_ar:.3f} con AR day-ahead "
-                f"({(mae_test - mae_test_ar) / mae_test * 100:.1f}% mejora)")
-
-    # ── [ENS] Ensemble robusto por DIVERSIDAD DE OBJETIVO (L2 + mediana + Huber) ──
-    # Sustituye al antiguo LGBM+XGB+Ridge (XGB≈LGBM, corr 0.99 → redundante).
-    # Validado en walk-forward 2024: +2.0 pp DirAcc (mejor en 12/12 meses) y
-    # ~+1.5% MAE vs LightGBM L2. Ver scripts/experiment_*.py y decisions.md DT-14.
-    logger.info("\n[ENS] Entrenando Ensemble diverso (LightGBM L2 + mediana + Huber)...")
-    try:
-        from src.model.diverse_ensemble import DiverseObjectiveEnsemble
-        ensemble = DiverseObjectiveEnsemble(
-            zone=zone,
-            base_params={**{"n_estimators": 2000}, **best_params},
-        )
-        # Fit en TRAIN con early stopping en VAL (disjuntos → sin leakage)
-        ensemble.fit(X[splits["train"]], y[splits["train"]],
-                     X[splits["val"]], y[splits["val"]], verbose=True)
-
-        # Guardar ensemble
-        ens_path = MODELS_DIR / f"ensemble_{zone}.pkl"
-        ensemble.save(str(ens_path))
-        logger.info(f"  Ensemble guardado: {ens_path.name}")
-
-        # Métricas ensemble en test
-        preds_ens = ensemble.predict(X_test)
-        mae_ens = float(np.mean(np.abs(y_test.values - preds_ens)))
-        dir_ens = float(np.mean(np.sign(np.diff(y_test.values)) ==
-                                np.sign(np.diff(preds_ens))) * 100)
-
-        # Ensemble + AR (day-ahead realista). AR ajustado sobre residuos train+val.
-        preds_ens_tv = ensemble.predict(X[trainval_mask])
-        ar_ens = ARResidualCorrector(max_order=3)
-        ar_ens.fit(y[trainval_mask].values, preds_ens_tv, verbose=False)
-        ar_ens_path = MODELS_DIR / f"ar_corrector_ensemble_{zone}.pkl"
-        ar_ens.save(str(ar_ens_path))
-        da_ens_metrics = simulate_day_ahead_correction(
-            y_test.values, preds_ens, ar_ens, verbose=False
-        )
-        mae_ens_ar = da_ens_metrics["MAE_day_ahead_corrected"]
-
-        logger.info(f"\n  ┌───────────────────────────────────────────────┐")
-        logger.info(f"  │  COMPARATIVA TEST — {zone}                       │")
-        logger.info(f"  ├───────────────────────────────────────────────┤")
-        logger.info(f"  │  LightGBM solo:    MAE {mae_test:6.2f} | DirAcc {dir_acc:4.1f}% │")
-        logger.info(f"  │  Ensemble diverso: MAE {mae_ens:6.2f} | DirAcc {dir_ens:4.1f}% ◄ │")
-        logger.info(f"  │  Ensemble + AR:    MAE {mae_ens_ar:6.2f}              │")
-        logger.info(f"  └───────────────────────────────────────────────┘")
-        has_ensemble = True
-    except Exception as e:
-        import traceback
-        logger.warning(f"  WARN: Ensemble diverso no disponible: {e}")
-        logger.debug(traceback.format_exc())
-        has_ensemble = False
-        mae_ens = None
-        mae_ens_ar = None
-
-    # 9. Guardar modelos
-    logger.info("\n[9] Guardando modelos...")
-    save_models(zone, model_final, quantile_models, feature_cols,
-                best_params, wf_results, logger)
-
-    # Métricas finales
-    final_metrics = {
-        "zone":          zone,
-        "MAE_test":      round(mae_test, 3),
-        "MAE_test_ar":   round(mae_test_ar, 3),
-        "MAE_test_ens":  round(mae_ens, 3) if mae_ens else None,
-        "MAE_test_ens_ar": round(mae_ens_ar, 3) if mae_ens_ar else None,
-        "RMSE_test":     round(rmse_test, 3),
-        "sMAPE_test":    round(smape_test, 3),
-        "DirAcc_test":   round(dir_acc, 2),
-        "R2_test":       round(r2_test, 4),
-        "MAE_wf_mean":   round(wf_results["MAE"].mean(), 3) if not wf_results.empty else None,
-        "MAE_wf_ar_mean": round(wf_results["MAE_ar"].mean(), 3) if "MAE_ar" in wf_results.columns else None,
-        "coverage_80":   coverage_stats["coverage_80"],
-        "coverage_50":   coverage_stats["coverage_50"],
-        "n_features":    len(feature_cols),
-        "best_params":   best_params,
-        "top5_features": feat_imp.head(5).index.tolist(),
-        "ar_order":      ar_corrector.best_order,
-        "ar_phi1":       round(ar_corrector.ar_coefs[0], 4),
-        "has_ensemble":  has_ensemble,
+    training = {
+        "zone": zone,
+        "generated_by": "src/model/train.py (train_zone)",
+        "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "splits_utc": {"train_end": TRAIN_END, "val_start": VAL_START, "val_end": VAL_END,
+                       "test_start": TEST_START, "test_end": TEST_END},
+        "rows": {k: int(v.sum()) for k, v in splits.items()},
+        "features": {"n": len(feature_cols), "rule": FEATURE_RULE[zone],
+                     "nan_fill": "median of the training rows"},
+        "hyperparameters": {
+            "source": params_source,
+            "params": best_params,
+            "point_models_n_estimators": FINAL_N_ESTIMATORS,
+            "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+            "lightgbm_common": LGB_COMMON,
+        },
+        "reference_default_lightgbm": {
+            "MAE_val": mae_default,
+            "trees_early_stopping_val": int(model_default.best_iteration_ or 0),
+        },
+        "optuna_MAE_val": mae_optuna,
+        "served": {
+            "model": selection["served_model"],
+            "use_ar": bool(ar_block["use_ar"]),
+            "trained_on": "train only (up to TRAIN_END); the validation quarter is "
+                          "used for early stopping, model choice, AR and calibration",
+        },
+        "selection_val": {k: v for k, v in selection.items()},
+        "ar_val": {k: v for k, v in ar_block.items() if k != "corrector"},
+        "quantiles_val": q_stats,
+        "conformal_val": {"strategy": "adaptive", "target": CONFORMAL_TARGET,
+                          "fitted_on": "validation quarter, raw quantile bands",
+                          **conf_diag},
+        "walk_forward": _wf_summary(wf_results),
+        "top5_features": top5,
+        "note": "No test-window metric is computed here; see results/evaluation_test2026_<zone>.json.",
     }
-
+    write_json(RESULTS_DIR / f"training_{zone}.json", training)
     save_run_metadata(
         script_name=f"train_{zone}",
-        params={
-            "zone": zone, "n_trials": n_trials,
-            "run_optuna": run_optuna,
-            "train_end": TRAIN_END, "test_start": TEST_START,
-        },
-        stats=final_metrics,
+        params={"zone": zone, "run_optuna": run_optuna, "n_trials": n_trials,
+                "train_end": TRAIN_END, "val_end": VAL_END},
+        stats={k: v for k, v in training.items() if k not in ("generated_by",)},
     )
-
-    logger.info(f"\nOK Entrenamiento {zone} completado.")
-    return final_metrics
+    logger.info(f"\nOK Entrenamiento {zone} completado → results/training_{zone}.json")
+    return training
 
 
 # ── Punto de entrada ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Entrenamiento modelo predictivo")
-    parser.add_argument("--zone",      default="DK1", choices=["DK1", "DK2", "FI"])
-    parser.add_argument("--no-optuna", action="store_true",
-                        help="Omitir optimización Optuna (más rápido)")
-    parser.add_argument("--trials",    type=int, default=N_TRIALS,
+    parser.add_argument("--zone",   default="DK1", choices=["DK1", "DK2", "FI"])
+    parser.add_argument("--all",    action="store_true", help="Entrenar DK1, DK2 y FI")
+    parser.add_argument("--optuna", action="store_true",
+                        help="Volver a buscar hiperparámetros con Optuna (lento)")
+    parser.add_argument("--trials", type=int, default=N_TRIALS,
                         help=f"Número de trials Optuna (default: {N_TRIALS})")
-    parser.add_argument("--both",      action="store_true",
-                        help="Entrenar DK1 y DK2 secuencialmente")
     args = parser.parse_args()
 
-    zones = ["DK1", "DK2"] if args.both else [args.zone]
-
-    all_results = {}
+    zones = ["DK1", "DK2", "FI"] if args.all else [args.zone]
     for zone in zones:
-        result = train_zone(
-            zone=zone,
-            run_optuna=not args.no_optuna,
-            n_trials=args.trials,
-        )
-        all_results[zone] = result
-
-    # Tabla resumen comparativa si se entrenaron ambas zonas
-    if len(all_results) > 1:
-        print("\n=== RESUMEN COMPARATIVO ===")
-        summary = pd.DataFrame(all_results).T[
-            ["MAE_test", "RMSE_test", "sMAPE_test", "DirAcc_test", "R2_test"]
-        ]
-        print(summary.to_string())
+        train_zone(zone=zone, run_optuna=args.optuna, n_trials=args.trials)

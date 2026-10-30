@@ -1,0 +1,143 @@
+{
+  "description": "Change in the served test MAE (January to May 2026) when inputs whose publication time is not stored are replaced by more conservative versions. Models are not retrained; only the prediction changes.",
+  "generated_by": "scripts/leakage_sensitivity.py",
+  "test_window_utc": [
+    "2026-01-01",
+    "2026-05-31 23:00"
+  ],
+  "reference": "served route: predict_with_bands on the feature table that step 14 writes from the unmodified master (local, not in the repository)",
+  "variants": {
+    "control": "features regenerated from the unmodified master (must match the served MAE)",
+    "meteo_previous_day1": "Open-Meteo Previous Runs API, run of the previous day (_previous_day1)",
+    "meteo_previous_day2": "Open-Meteo Previous Runs API, run of two days before (_previous_day2)",
+    "remit_known_11cet": "REMIT unavailability for every hour of D set to the value in force at 11:00 CET on D-1",
+    "wind_solar_fc_d_minus_1": "pessimistic bound: ENTSO-E (Germany and Nordic zones) and Fingrid wind and solar day-ahead forecasts replaced by those of the previous day (24 h earlier)"
+  },
+  "zones": {
+    "DK1": {
+      "generated_on": "2026-10-30",
+      "n_hours": 3624,
+      "MAE_served": 15.93,
+      "variants": {
+        "control": {
+          "MAE": 15.93,
+          "delta_vs_served": 0.0,
+          "n_hours": 3624,
+          "master_cells_changed": 0
+        },
+        "meteo_previous_day1": {
+          "MAE": 16.012,
+          "delta_vs_served": 0.0821,
+          "n_hours": 3624,
+          "master_cells_changed": 192994,
+          "delta_vs_control": 0.0821
+        },
+        "meteo_previous_day2": {
+          "MAE": 16.0239,
+          "delta_vs_served": 0.0939,
+          "n_hours": 3624,
+          "master_cells_changed": 200010,
+          "delta_vs_control": 0.0939
+        },
+        "remit_known_11cet": {
+          "MAE": 15.9487,
+          "delta_vs_served": 0.0187,
+          "n_hours": 3624,
+          "master_cells_changed": 81144,
+          "delta_vs_control": 0.0187
+        },
+        "wind_solar_fc_d_minus_1": {
+          "MAE": 26.0182,
+          "delta_vs_served": 10.0882,
+          "n_hours": 3624,
+          "master_cells_changed": 501362,
+          "delta_vs_control": 10.0882
+        }
+      }
+    },
+    "DK2": {
+      "generated_on": "2026-10-30",
+      "n_hours": 3624,
+      "MAE_served": 18.9187,
+      "variants": {
+        "control": {
+          "MAE": 18.9187,
+          "delta_vs_served": 0.0,
+          "n_hours": 3624,
+          "master_cells_changed": 0
+        },
+        "meteo_previous_day1": {
+          "MAE": 19.0,
+          "delta_vs_served": 0.0813,
+          "n_hours": 3624,
+          "master_cells_changed": 192994,
+          "delta_vs_control": 0.0813
+        },
+        "meteo_previous_day2": {
+          "MAE": 18.86,
+          "delta_vs_served": -0.0587,
+          "n_hours": 3624,
+          "master_cells_changed": 200010,
+          "delta_vs_control": -0.0587
+        },
+        "remit_known_11cet": {
+          "MAE": 18.9356,
+          "delta_vs_served": 0.0169,
+          "n_hours": 3624,
+          "master_cells_changed": 81144,
+          "delta_vs_control": 0.0169
+        },
+        "wind_solar_fc_d_minus_1": {
+          "MAE": 29.9346,
+          "delta_vs_served": 11.0159,
+          "n_hours": 3624,
+          "master_cells_changed": 501362,
+          "delta_vs_control": 11.0159
+        }
+      }
+    },
+    "FI": {
+      "generated_on": "2026-10-30",
+      "n_hours": 3624,
+      "MAE_served": 21.4548,
+      "variants": {
+        "control": {
+          "MAE": 21.4548,
+          "delta_vs_served": 0.0,
+          "n_hours": 3624,
+          "master_cells_changed": 0
+        },
+        "meteo_previous_day1": {
+          "MAE": 21.4361,
+          "delta_vs_served": -0.0187,
+          "n_hours": 3624,
+          "master_cells_changed": 192994,
+          "delta_vs_control": -0.0187
+        },
+        "meteo_previous_day2": {
+          "MAE": 21.4743,
+          "delta_vs_served": 0.0195,
+          "n_hours": 3624,
+          "master_cells_changed": 200010,
+          "delta_vs_control": 0.0195
+        },
+        "remit_known_11cet": {
+          "MAE": 21.4236,
+          "delta_vs_served": -0.0312,
+          "n_hours": 3624,
+          "master_cells_changed": 81144,
+          "delta_vs_control": -0.0312
+        },
+        "wind_solar_fc_d_minus_1": {
+          "MAE": 34.4402,
+          "delta_vs_served": 12.9854,
+          "n_hours": 3624,
+          "master_cells_changed": 501362,
+          "delta_vs_control": 12.9854
+        }
+      }
+    }
+  },
+  "generated_on": "2026-10-30",
+  "method": "copy of the master, one input replaced per variant, features regenerated (features.generate_features), served models of src/model/train.py unchanged, prediction with predict.served_predictions over the test window"
+}

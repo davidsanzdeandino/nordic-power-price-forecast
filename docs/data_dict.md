@@ -24,6 +24,7 @@ forecast, demanda, flujos, NTC, meteo, Energinet, commodities, REMIT y derivadas
 11. [Flags de precio](#11-flags-de-precio)
 12. [Track Finlandia — acoplamiento FI + Fingrid](#12-track-finlandia--acoplamiento-fi--fingrid)
 13. [Precios de mercados de reservas/balancing (Battery Lab)](#13-precios-de-mercados-de-reservasbalancing-battery-lab)
+14. [Embalses hidroeléctricos](#14-embalses-hidroeléctricos)
 
 ---
 
@@ -47,7 +48,7 @@ Nota (23-oct-2026): en la ejecución de junio de 2026 la deduplicación por time
 | `price_entsoe_DK2` | float | EUR/MWh | ENTSO-E | Precio DK2 según ENTSO-E (validación cruzada) |
 
 **Valores esperados:** Rango típico -50 a 500 EUR/MWh en 2023-2024. Valores negativos posibles (exceso renovables). Ver flags en sección 11.  
-**Nulos:** Huecos rellenos hasta 6h (ver DT-05). Huecos >6h quedan como NaN.
+**Nulos:** se rellenan las 6 primeras horas de cada hueco (3 interpoladas y 3 repetidas, ver DT-05); el resto de un hueco más largo queda como NaN.
 
 ---
 
@@ -265,14 +266,16 @@ Generadas en `cleaning.py` a partir de los precios DK1/DK2. Prefijo de zona.
 Columnas añadidas para el producto finlandés (DK queda intacto). Generadas por
 `src/extract/08_finland_coupling.py` (acoplamiento) y `src/extract/09_fingrid_fi.py`
 (Fingrid). Todos los precios/forecasts de acoplamiento se usan **laggeados ≥24h**
-en features (misma subasta EUPHEMIA → anti-leakage). Ver `docs/decisions.md` DT-17/DT-18.
+en features (misma subasta EUPHEMIA). Los programas de intercambio FI son
+totales (A05, con intradiario), así que su lag de 24 h puede incluir operaciones
+posteriores a la subasta (Limitations del README). Ver `docs/decisions.md` DT-17/DT-18.
 
 ### 12a. Acoplamiento de mercado (extractor 08)
 
 | Columna | Tipo | Unidad | Fuente | Descripción |
 |---------|------|--------|--------|-------------|
 | `price_SE1`, `price_EE` | float | EUR/MWh | ENTSO-E | Precios de acoplamiento (ver sección 1) |
-| `sched_FIEE_mw` / `sched_EEFI_mw` | float | MW | ENTSO-E | Intercambio programado FI→EE / EE→FI (EstLink) |
+| `sched_FIEE_mw` / `sched_EEFI_mw` | float | MW | ENTSO-E | Intercambio programado FI→EE / EE→FI (EstLink). En FI son programas totales (A05, incluyen intradiario); los daneses son day-ahead (A01) |
 | `sched_FISE_3_mw` / `sched_SE_3FI_mw` | float | MW | ENTSO-E | Intercambio programado FI↔SE3 |
 | `sched_FISE_1_mw` / `sched_SE_1FI_mw` | float | MW | ENTSO-E | Intercambio programado FI↔SE1 |
 | `wx_VaasaFI_*` | float | varias | Open-Meteo | Meteo Vaasa (nodo eólico onshore de la costa oeste) — mismas variables que sección 7 |
@@ -281,8 +284,16 @@ en features (misma subasta EUPHEMIA → anti-leakage). Ver `docs/decisions.md` D
 
 ### 12b. Fingrid — previsiones day-ahead del TSO finlandés (extractor 09)
 
-Previsiones "updated once a day" (publicadas antes de la subasta → leakage-safe).
-Cobertura 99,9-100% desde 2023, salvo OL3 (~40%, dataset reciente).
+Previsiones publicadas una vez al día, el día anterior a las 12:00 EET según las
+páginas de Fingrid (se toma como hora finlandesa: 11:00 CET); la de OL3 (372), a las
+10:00 y actualizada desde las 11:00 con la capacidad reservada para mantenimiento.
+Cubren el día finlandés siguiente (00-24 hora finlandesa). El master las guarda por hora UTC, así que la última hora CET de cada
+día de entrega D (00-01 hora finlandesa de D+1) sale de la previsión publicada el
+propio día D, después de la subasta. En las features esa hora toma el valor de la
+hora anterior (`_fingrid_known_at_auction` en `src/model/features.py`); el lag de
+24 h del residual load usa la serie sin sustituir, que ya estaba publicada.
+Cobertura 99,9-100% desde 2023, salvo OL3, que empieza el 3-ene-2025 (~41% del periodo;
+antes queda NaN y se rellena con la mediana de train).
 
 | Columna | Tipo | Unidad | Fuente | Descripción |
 |---------|------|--------|--------|-------------|
@@ -297,6 +308,8 @@ Cobertura 99,9-100% desde 2023, salvo OL3 (~40%, dataset reciente).
 |---------|-------------|
 | `feat_FI_fingrid_residual_load` | Residual load según Fingrid (carga−eólica−solar). **Feature #1 del modelo FI** |
 | `feat_FI_loadfc_disagreement` | Desacuerdo de previsión de carga Fingrid vs ENTSO-E (incertidumbre del sistema) |
+| `feat_FI_fingrid_load_fc`, `feat_FI_fingrid_wind_fc`, `feat_FI_fingrid_ol3_fc`, `feat_FI_fingrid_wind_penetration` | Previsiones de Fingrid y penetración eólica, con la última hora CET sustituida por la anterior |
+| `feat_FI_fingrid_resid_load_lag24h` | Residual load de Fingrid de la misma hora del día anterior |
 | `feat_FI_SE3_spread_lag24h`, `feat_FI_EE_spread_lag24h` | Spreads de acoplamiento laggeados FI-SE3 / FI-EE |
 | `feat_sched_net_FI_EE`, `feat_sched_net_FI_SE_3` | Flujo neto programado FI↔EE / FI↔SE3 |
 | `feat_post_ol3` | Flag de régimen post-Olkiluoto-3 (quiebre estructural 2023-04-16) |
@@ -330,10 +343,39 @@ inputs contemporáneos del forecast.
 
 ---
 
+## 14. Embalses hidroeléctricos
+
+Fuente: ENTSO-E (Aggregated Filling Rate of Water Reservoirs and Hydro Storage Plants),
+extractor `src/extract/07_entsoe_hydro_exchanges.py`. Dato semanal, con la marca de
+inicio de su semana (lunes 00:00 CET); el master lo propaga hacia delante, así que
+cada semana ocupa sus propias horas. Se publica como tarde el tercer día laborable
+después de la semana (Reglamento 543/2013, art. 16.2(d)).
+
+| Columna | Tipo | Unidad | Descripción |
+|---------|------|--------|-------------|
+| `reservoir_{FI,NO_2,SE_3,SE_4}_stored_mwh` | float | MWh | Energía almacenada en embalses de la zona (master) |
+
+Features (en `dataset_features.parquet`, `add_hydro_features`), todas con un lag de
+13 días (`RESERVOIR_LAG` = 312 h): la semana W entra por primera vez el domingo de
+W+1, cuya subasta cierra después del plazo de publicación (viernes de W+1 como tarde
+con dos festivos entre semana; si el 24 de diciembre contara como no laborable, las
+semanas de Navidad de 2024 y 2025, en train y validación, tendrían el plazo el lunes
+siguiente). Lo comprueba `tests/test_features_publication.py`.
+
+| Feature | Descripción |
+|---------|-------------|
+| `feat_reservoir_{zona}_lag13d` | Nivel de la zona con 13 días de lag |
+| `feat_reservoir_nordic_total_lag13d` | Suma de las zonas con dato |
+| `feat_reservoir_{zona}_chg4w` | Cambio del nivel laggeado en 4 semanas |
+| `feat_reservoir_{zona}_anomaly` | Nivel laggeado menos la normal estacional (media por semana ISO calculada solo con las filas de train; las semanas sin dato en train toman la media de train de la zona) |
+| `feat_reservoir_nordic_anomaly` | Suma de las anomalías de las zonas con dato |
+
+---
+
 ## Notas generales
 
 - **Índice:** Siempre UTC tz-aware. Para convertir a hora local danesa: `df.index.tz_convert('Europe/Copenhagen')`.
-- **Nulos residuales:** Huecos >6h no rellenados quedan como `NaN`. Antes de entrenar el modelo, aplicar `dropna(subset=['price_DK1', 'price_DK2'])` como mínimo.
+- **Nulos residuales:** Las horas de un hueco a partir de la séptima quedan como `NaN`. Antes de entrenar el modelo, aplicar `dropna(subset=['price_DK1', 'price_DK2'])` como mínimo.
 - **Acceso rápido a columnas por categoría:**
   ```python
   price_cols    = [c for c in df.columns if c.startswith('price_')]

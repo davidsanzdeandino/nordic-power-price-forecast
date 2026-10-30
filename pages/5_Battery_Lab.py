@@ -48,7 +48,7 @@ MASTER_PATH = ROOT / "data" / "master" / "dataset_master.parquet"
 U_CAPALO_FI = "https://capaloai.com/blog/finnish-bess-market/"
 U_CAPALO_Q2 = "https://capaloai.com/blog/capalo-zeus-vpp-quarterly-performance-q2-2025/"
 U_CH = "https://www.cleanhorizon.com/news/storage-index-update-finland-in-focus/"
-U_EBI = "https://europeanbessindex.com/"
+U_EBI = "https://www.cleanhorizon.com/battery-index/"
 U_FG_FCR = "https://www.fingrid.fi/en/news/news/2025/procurement-of-frequency-containment-reserves-from-yearly-market-2026/"
 U_FG_1GW = "https://www.fingrid.fi/en/news/news/2026/the-combined-capacity-of-electricity-storages-in-finland-now-exceeds-1000-mw"
 U_STATKRAFT = "https://www.statkraft.com/newsroom/news-and-stories/2026/statkraft-signs-contract-with-OX2-to-optimize-large-scale-batteries-in-finland/"
@@ -150,7 +150,8 @@ have_reserves = cfg["fcrn"] in data.columns and data[cfg["fcrn"]].notna().sum() 
 
 st.title("Battery Lab — Multi-market Revenue Stacking")
 st.markdown(
-    f"A **datasheet-based battery** ({spec.name}) operating the full Nordic "
+    f"A battery ({spec.name}; datasheet values for the commercial systems, "
+    f"parametric with estimated fields for the generic one) operating the full Nordic "
     f"revenue stack in **{cfg['zone']}**: FCR-N + FCR-D (frequency reserves, "
     f"hourly marginal-price markets) co-optimised with **day-ahead arbitrage** "
     f"under the actual Nordic TSO LER rules. Reserve prices: realised market "
@@ -165,7 +166,7 @@ if not have_reserves:
     st.stop()
 
 # ── 1) Ficha técnica de la batería ───────────────────────────────────────────
-st.markdown("## 1 · The battery (datasheet, not wishful thinking)")
+st.markdown("## 1 · The battery (datasheet or estimated values, flagged)")
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("MW / MWh", f"{spec.power_mw:.2f} / {spec.energy_mwh:.2f}",
           help=f"Power {spec.power_mw:.3f} MW, usable energy {spec.energy_mwh:.3f} MWh "
@@ -240,7 +241,7 @@ else:
             "markets, so it is expected to sit below those figures.\n"
             "- 2026 YTD: ≈ "
             f"**€{yearly.loc[2026, 'gross_per_mw']/1000:,.0f}k/MW**, to compare with the "
-            f"[European BESS Index]({U_EBI}) range for Finland (€70–130k/MW/yr). "
+            f"[Clean Horizon Storage Index]({U_EBI}) for Finland. "
             "Fingrid procured no FCR-N from its yearly market for 2026 "
             f"([Fingrid, 3 Nov 2025]({U_FG_FCR})), and storage capacity in "
             f"Finland passed 1,000 MW in 2026 ([Fingrid]({U_FG_1GW})).\n\n"
@@ -360,16 +361,18 @@ per hour: charge `c`, discharge `d`, FCR-N `rn`, FCR-D up `ru`, FCR-D down `rd`.
 (the growth market post-FCR-saturation — their realised prices ARE in the
 master dataset for analysis), intraday re-optimisation, 15-min MTU products
 (post Oct-2025 the day-ahead is 15-min; we aggregate hourly), imbalance/passive
-balancing, and portfolio effects. **The stack shown is therefore a
-conservative floor for 2025-26** — and still shows the FCR collapse clearly.
+balancing, and portfolio effects. A battery that also trades those markets
+could earn more than the stack shown, which still shows the fall in FCR
+revenue clearly.
 
-**Price-taker assumption:** a 1-5 MW battery does not move these markets, but
-the *fleet* does — that cannibalisation is precisely the 2023→2026 story shown
-above, and it is endogenous in the realised prices we settle against.
+**Price-taker assumption:** a 1-5 MW battery does not move these markets. The
+fall in reserve prices from 2023 to 2026 coincides with more batteries joining
+the Finnish reserve markets; that effect is already in the realised prices we
+settle against, but its size is not measured here.
 """)
 
 st.caption(
     "Reserve prices: realised hourly marginal prices from the TSO "
     f"({cfg['source']}). Battery specs: vendor datasheets with estimated "
     "fields flagged. All revenue figures are settled against realised prices "
-    "— no simulated or mock numbers anywhere on this page.")
+    "— no demo or synthetic data on this page.")

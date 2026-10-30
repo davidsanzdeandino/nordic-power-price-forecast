@@ -400,39 +400,50 @@ def _mock_feature_importance(zone: str = "DK1") -> pd.DataFrame:
 
 def _load_real_metrics(zone: str) -> dict:
     """
-    Lee las métricas reales de test del último metadato de entrenamiento
-    (data/metadata/train_<zone>_*.json) para mostrarlas en el dashboard.
-    summary() del predictor no las incluye, así que las añadimos aquí.
-    Devuelve {} si no hay metadatos.
+    Métricas reales para el dashboard:
+      - del modelo servido en el test: data/metadata/served_metrics_<zone>.json
+        (scripts/gen_served_metrics.py, misma ruta que predict_with_bands);
+      - de la elección y el walk-forward en validación:
+        results/training_<zone>.json (src/model/train.py).
+    La etiqueta del modelo servido sale de esos ficheros (served_model/use_ar),
+    no de una regla por zona. Devuelve {} si no hay ninguno.
     """
-    import json, glob
-    meta_dir = ROOT / "data" / "metadata"
-    files = sorted(glob.glob(str(meta_dir / f"train_{zone}_*.json")))
-    if not files:
-        return {}
-    try:
-        with open(files[-1], encoding="utf-8") as f:
-            stats = json.load(f).get("stats", {})
-    except Exception:
-        return {}
-    keep = ["MAE_test", "MAE_test_ar", "MAE_test_ens_ar", "RMSE_test",
-            "DirAcc_test", "R2_test", "MAE_wf_mean", "coverage_80",
-            "coverage_80_conformal"]
-    out = {k: stats[k] for k in keep if k in stats and stats[k] is not None}
-    out["production_model"] = ("Diverse ensemble (L2+median+Huber)"
-                               if zone in {"FI"} else "LightGBM") + " + AR"
-    # Mostrar el MAE/DirAcc del modelo REALMENTE servido por predict.py
-    # (medido sobre su salida real), no el de un sub-modelo interno. Lo persiste
-    # scripts/evaluate_fi_regimes.py en served_metrics_<zone>.json.
-    served_path = meta_dir / f"served_metrics_{zone}.json"
+    import json
+    out = {}
+    training_path = ROOT / "results" / f"training_{zone}.json"
+    if training_path.exists():
+        try:
+            tr = json.load(open(training_path, encoding="utf-8"))
+            wf = tr.get("walk_forward", {}).get("MAE_monthly", {})
+            if wf.get("mean") is not None:
+                out["MAE_wf_mean"] = wf["mean"]
+            sel = tr.get("selection_val", {})
+            for k in ("MAE_val_ensemble", "MAE_val_lightgbm_train",
+                      "DM_ensemble_vs_lightgbm", "DM_p_value"):
+                if sel.get(k) is not None:
+                    out[k] = sel[k]
+            srv = tr.get("served", {})
+            if srv:
+                out["served_model"] = srv.get("model")
+                out["use_ar"] = srv.get("use_ar")
+        except Exception:
+            pass
+    served_path = ROOT / "data" / "metadata" / f"served_metrics_{zone}.json"
     if served_path.exists():
         try:
             served = json.load(open(served_path, encoding="utf-8"))
-            for k in ("MAE_test", "DirAcc_test", "MAE_vs_lear", "MAE_lear"):
+            for k in ("MAE_test", "RMSE_test", "DirAcc_test", "R2_test", "n_test",
+                      "MAE_vs_lear", "MAE_lear", "MAE_persistence_24h",
+                      "MAE_change_vs_lear_pct", "MAE_change_vs_persistence_24h_pct",
+                      "production_model", "served_model", "use_ar"):
                 if served.get(k) is not None:
                     out[k] = served[k]
         except Exception:
             pass
+    if "production_model" not in out and out.get("served_model"):
+        from src.model.predict import served_model_label
+        out["production_model"] = served_model_label(out["served_model"],
+                                                     bool(out.get("use_ar")))
     return out
 
 
@@ -708,8 +719,9 @@ def render_data_source_banner(zone: str = "DK1") -> bool:
             f"`python run_pipeline.py` (or `--fast` to train without Optuna)."
         )
     else:
+        label = _load_real_metrics(zone).get("production_model") or "LightGBM"
         st.caption(
-            f"Real pipeline data · zone {zone} · "
-            f"model `lightgbm_{zone}.pkl` loaded from `data/models/`"
+            f"Real pipeline data · zone {zone} · served model: {label} "
+            f"(trained models in `data/models/`)"
         )
     return demo

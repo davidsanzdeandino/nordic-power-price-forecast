@@ -13,11 +13,13 @@ Extrae de ENTSO-E dos señales adicionales de alto valor para el precio nórdico
      de los flujos físicos reales.
 
 ANTI-LEAKAGE (importante):
-  - Embalses: dato SEMANAL publicado con retraso (el valor de la semana W se
-    publica al cierre de W). Se guarda tal cual (índice semanal). En la fase de
-    features se reindexará a horario con forward-fill y se aplicará un LAG de
-    1 semana (168h), de modo que en la subasta del día D solo se use el último
-    nivel ya PUBLICADO. Ver features.add_hydro_reservoir_features.
+  - Embalses: dato SEMANAL publicado con retraso (el valor de la semana W lleva
+    la marca de inicio de W, lunes 00:00 CET, y se publica como tarde el tercer
+    día laborable después de W; Reglamento 543/2013, art. 16.2(d)). Se guarda
+    tal cual (índice semanal). La integración lo reindexa a horario con
+    forward-fill y features.py aplica un LAG de 13 días (312 h,
+    features.RESERVOIR_LAG), de modo que en la subasta del día D solo se use un
+    nivel ya PUBLICADO. Ver features.add_hydro_features.
   - Intercambios programados: aunque son "day-ahead", se determinan en el mismo
     clearing que el precio que queremos predecir. Para evitar circularidad se
     usan con LAG de 24h en features (el programa de ayer). Aquí solo se descargan.

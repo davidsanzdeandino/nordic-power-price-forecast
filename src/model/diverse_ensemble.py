@@ -28,6 +28,8 @@ scripts/experiment_vst.py y docs/decisions.md DT-14).
 import pickle
 import numpy as np
 
+from src.model.config import LGB_COMMON
+
 
 class DiverseObjectiveEnsemble:
     """Promedio de 3 LightGBM con objetivos diversos (L2, mediana, Huber)."""
@@ -46,12 +48,15 @@ class DiverseObjectiveEnsemble:
         self.fitted = False
 
     def fit(self, X_tr, y_tr, X_val=None, y_val=None, verbose: bool = False):
-        """Entrena los 3 modelos. Si se dan X_val/y_val, usa early stopping."""
+        """Entrena los 3 modelos. Si se dan X_val/y_val, usa early stopping.
+
+        X_val debe ser disjunto de X_tr (en train.py: train hasta sep-2025 y
+        early stopping en el trimestre de validación oct-dic 2025).
+        """
         import lightgbm as lgb
         for name, objective, extra in self.OBJECTIVES:
             params = dict(self.base_params)
-            params.update(objective=objective, metric="mae",
-                          random_state=42, n_jobs=-1, verbose=-1)
+            params.update(objective=objective, metric="mae", **LGB_COMMON)
             params.update(extra)               # alpha del objetivo (sobreescribe)
             model = lgb.LGBMRegressor(**params)
             if X_val is not None and y_val is not None:

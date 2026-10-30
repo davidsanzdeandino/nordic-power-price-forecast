@@ -1,0 +1,51 @@
+{
+  "description": "LightGBM hyperparameters chosen by Optuna (TPE sampler, seed 42, 100 trials, minimising the validation MAE of a LightGBM trained on train with early stopping on the October-December 2025 validation quarter). Copied unchanged from stats.best_params of the training runs named below; those run files (data/metadata/<source_run>.json) are in the first public commit, daa6a76, and were removed from the tree afterwards. src/model/train.py loads them by default; run_pipeline.py --optuna searches again.",
+  "objective": "regression (L2), metric MAE",
+  "zones": {
+    "DK1": {
+      "source_run": "train_DK1_20260605_145726",
+      "date": "2026-06-05",
+      "n_trials": 100,
+      "params": {
+        "learning_rate": 0.03245832654032126,
+        "num_leaves": 208,
+        "max_depth": 11,
+        "min_child_samples": 91,
+        "subsample": 0.8405166006437674,
+        "colsample_bytree": 0.6267658833443015,
+        "reg_alpha": 0.03617609691215383,
+        "reg_lambda": 0.09305580067728259
+      }
+    },
+    "DK2": {
+      "source_run": "train_DK2_20260605_151856",
+      "date": "2026-06-05",
+      "n_trials": 100,
+      "params": {
+        "learning_rate": 0.03689526641029514,
+        "num_leaves": 234,
+        "max_depth": 12,
+        "min_child_samples": 42,
+        "subsample": 0.8017089972803263,
+        "colsample_bytree": 0.6324354550630996,
+        "reg_alpha": 2.628099792318213,
+        "reg_lambda": 0.008528974695768122
+      }
+    },
+    "FI": {
+      "source_run": "train_FI_20260606_091405",
+      "date": "2026-06-06",
+      "n_trials": 100,
+      "params": {
+        "learning_rate": 0.09872590293544499,
+        "num_leaves": 36,
+        "max_depth": 5,
+        "min_child_samples": 94,
+        "subsample": 0.7590637637326296,
+        "colsample_bytree": 0.6265655646327017,
+        "reg_alpha": 0.6722071488534517,
+        "reg_lambda": 0.33206546634581324
+      }
+    }
+  }
+}

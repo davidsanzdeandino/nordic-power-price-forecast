@@ -72,7 +72,7 @@ COUNTRY_VALUE = {
                           "platforms combine a day-ahead price forecast with a bid "
                           "optimiser. This case covers only the forecast-driven arbitrage "
                           "layer; the **Battery Lab** page stacks it with the FCR-N / FCR-D "
-                          "reserve markets for datasheet-based battery models.",
+                          "reserve markets for commercial (datasheet) and generic (parametric) batteries.",
         "industrial_anchor": "**Finnish context:** heavy industry (e.g. the Kokkola zinc "
             "smelter), battery-materials sites and data centres are large, partly-flexible "
             "loads, and Finland's cheap, low-carbon electricity keeps attracting new "
@@ -216,7 +216,7 @@ with hcol2.popover("How value is measured"):
         "**The model's real value = (model − naive)**, and we report what % of the "
         "oracle's achievable headroom it captures. Decisions use the forecast; "
         "settlement always uses the **real** day-ahead price. Back-tested on the "
-        "unseen Jan–May 2026 test set and annualised."
+        "out-of-sample Jan–May 2026 test window and annualised."
     )
 
 if g.empty:
@@ -247,11 +247,11 @@ if _econ and _econ.get("gross_model_annual"):
     if _mae is not None:
         _skill = (f" The model's day-ahead error is **{_mae:.1f} €/MWh MAE**"
                   + (f" — €{abs(_vslear):.1f}/MWh better than the LEAR baseline" if _vslear else "")
-                  + ", and it beats LEAR in every price regime.")
+                  + ".")
     st.markdown("#### Back-tested value — in euros")
     st.success(
-        f"Built on **100% free public data**, validated on **unseen 2026 {country['name']} "
-        f"prices**. A **1 MW / 2 h battery** captures **€{_m:,.0f}/yr** of day-ahead arbitrage "
+        f"Built on **100% free public data**, backtested out of sample on **Jan–May 2026 "
+        f"{country['name']} prices**. A **1 MW / 2 h battery** captures **€{_m:,.0f}/yr** of day-ahead arbitrage "
         f"with our forecast — vs **€{_floor:,.0f}** with a **{_flbl}** baseline and "
         f"**€{_n:,.0f}** scheduling naively: a **€{_edge:,.0f} / MW·yr edge over the "
         f"{_flbl} baseline**, capturing **{_pct:.0f}%** of the headroom a perfect forecast adds over "
@@ -603,8 +603,9 @@ with st.expander("How to read the incremental value"):
         "(winter, congested zones) and bigger movable volume.\n"
         "- A forecast is only worth paying for while its cost stays **below the incremental "
         "value**; each case above shows that break-even against the cost you enter.\n"
-        "- Everything here is back-tested **out-of-sample** on real public data with "
-        "**no leakage**; the oracle bar makes the remaining headroom explicit."
+        "- Everything here is back-tested **out-of-sample** on real public data, "
+        "with the served day-ahead forecast; the oracle bar makes the remaining "
+        "headroom explicit."
     )
 
 st.divider()
@@ -612,14 +613,21 @@ st.divider()
 # ── Supuestos y limitaciones ────────────────────────────────────────────────────
 st.markdown("### Assumptions & limitations (read before quoting any number)")
 with st.expander("What this simulation **does** and **does not** capture", expanded=False):
-    _mae_line = ("MAE ≈ 21 €/MWh, beating a zone-aware LEAR by ~27% and winning in "
-                 "**every** price regime (FI is Europe's most volatile market)."
-                 if country["name"] == "Finland" else
-                 "MAE ≈ 14.5–17 €/MWh, beating a zone-aware LEAR by ~35%.")
+    # Cifras del modelo servido, leídas de served_metrics_<zona>.json
+    _parts = []
+    for _z in country["modeled_zones"]:
+        _m = load_model_summary(_z)
+        if isinstance(_m.get("MAE_test"), (int, float)):
+            _txt = f"{_z} MAE {_m['MAE_test']:.1f} €/MWh"
+            if isinstance(_m.get("MAE_change_vs_lear_pct"), (int, float)):
+                _txt += f" ({_m['MAE_change_vs_lear_pct']:+.0f}% vs a zone-aware LEAR)"
+            _parts.append(_txt)
+    _mae_line = ("; ".join(_parts) + ".") if _parts else "served-model metrics not available."
     st.markdown(
         "**What's solid / real**\n"
-        "- The forecast is genuine, **out-of-sample (Jan–May 2026) and leakage-free**; "
-        f"{_mae_line}\n"
+        "- The forecast is genuine and **out-of-sample (Jan–May 2026)**, built from "
+        "information available before the day-ahead auction (the README lists the "
+        f"remaining data-timing limitations); {_mae_line}\n"
         "- Decisions use the forecast; **settlement is always at the real price** — the "
         "standard EPF value methodology.\n"
         "- The benchmark is **LEAR**, a respectable commercial-grade baseline, not a "

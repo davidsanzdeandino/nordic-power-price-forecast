@@ -27,7 +27,10 @@ Uso:
     python src/model/baselines.py
 """
 
+import json
 import sys
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -51,9 +54,17 @@ TARGET_COLS = {
     "FI":  "price_FI",
 }
 
-# Split temporal: últimos 3 meses = test, resto = train
-# Coincide con el esquema de evaluación de train.py
+# Inicio del test (enero-mayo de 2026). Los baselines se ajustan con todo lo
+# anterior (train + validación) y se puntúan desde aquí.
 TEST_START = "2026-01-01"
+
+# Fichero publicado que escriben los pasos 15-17 (una zona por paso).
+RESULTS_PATH = ROOT / "results" / "baselines_test2026.json"
+
+# Nombre de cada baseline en el JSON publicado, en el orden de la tabla.
+RESULT_KEYS = {"Persistence_24h": "persistence_24h",
+               "WeeklyMean_4w": "weekly_mean_4w",
+               "LEAR": "lear"}
 
 
 # ── 1. Persistence Naive ──────────────────────────────────────────────────────
@@ -343,12 +354,16 @@ def _compute_metrics(y_true: pd.Series, y_pred: pd.Series, model_name: str) -> d
     }
 
 
-def run_all_baselines(zone: str = "DK1") -> pd.DataFrame:
+def run_all_baselines(zone: str = "DK1", write: bool = True,
+                      out_path: Path | None = None) -> pd.DataFrame:
     """
     Ejecuta los 3 baselines para una zona y devuelve tabla comparativa.
 
     Args:
-        zone: Zona de precio a evaluar ('DK1' o 'DK2')
+        zone:     Zona de precio a evaluar ('DK1', 'DK2' o 'FI')
+        write:    Si True, escribe la zona en results/baselines_test2026.json
+                  (o en out_path) sin tocar las demás zonas.
+        out_path: Ruta alternativa del JSON (tests).
 
     Returns:
         DataFrame con métricas de los 3 baselines.
@@ -411,14 +426,97 @@ def run_all_baselines(zone: str = "DK1") -> pd.DataFrame:
     logger.info(f"TABLA COMPARATIVA BASELINES — {zone}")
     logger.info(f"{'='*60}")
     logger.info(f"\n{df_results.to_string()}")
-    logger.info(
-        f"\n  Benchmark típico Nord Pool:"
-        f"\n    MAE    5-15 EUR/MWh (modelos competitivos)"
-        f"\n    RMSE   8-20 EUR/MWh"
-        f"\n    DirAcc 55-65%"
-    )
+
+    if write:
+        path = write_baselines_json(zone, results, series, out_path)
+        logger.info(f"\n  Escrito: {path.name} (zona {zone})")
 
     return df_results
+
+
+def _zone_block(results: list, series: pd.Series) -> dict:
+    """Bloque de una zona del JSON publicado a partir de las métricas calculadas."""
+    test = series[series.index >= pd.Timestamp(TEST_START, tz="UTC")]
+    by_model = {m["model"]: m for m in results}
+    mae_persistence = by_model["Persistence_24h"]["MAE"]
+    baselines = {}
+    for model, key in RESULT_KEYS.items():
+        m = by_model[model]
+        baselines[key] = {
+            "model": model,
+            "n_obs": int(m["n_obs"]),
+            "MAE": float(m["MAE"]),
+            "RMSE": float(m["RMSE"]),
+            "sMAPE_pct": float(m["sMAPE"]),
+            "DirAcc_pct": float(m["DirAcc"]),
+            "R2": float(m["R2"]),
+            "rMAE_vs_persistence_24h": round(float(m["MAE"]) / float(mae_persistence), 3),
+        }
+    return {
+        "test_period": {
+            "start_utc": test.index.min().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_utc": test.index.max().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "hours": int(len(test)),
+        },
+        "series_period": {
+            "start": series.index.min().strftime("%Y-%m-%d"),
+            "end": series.index.max().strftime("%Y-%m-%d"),
+            "hourly_observations": int(len(series)),
+        },
+        "baselines": baselines,
+    }
+
+
+def _zone_order(zone: str):
+    """Orden de las zonas en el JSON: DK1, DK2, FI y después el resto por nombre."""
+    order = list(TARGET_COLS)
+    return (order.index(zone), "") if zone in order else (len(order), zone)
+
+
+def write_baselines_json(zone: str, results: list, series: pd.Series,
+                         out_path: Path | None = None) -> Path:
+    """Escribe (o actualiza) results/baselines_test2026.json con la zona dada.
+
+    Las demás zonas del fichero se conservan: cada paso 15-17 reescribe solo la
+    suya, junto con la cabecera común.
+    """
+    from src.model.results_io import write_json
+
+    path = Path(out_path) if out_path is not None else RESULTS_PATH
+    old = json.load(open(path, encoding="utf-8")) if path.exists() else {}
+    zones = dict(old.get("zones", {}))
+    zones[zone] = _zone_block(results, series)
+    out = {
+        "description": "Day-ahead price baselines on the out-of-sample test set "
+                       "(January to May 2026, hourly, UTC).",
+        "source": "Written by src/model/baselines.py (run_all_baselines), pipeline "
+                  "steps 15-17, one zone per step.",
+        "generated_on": datetime.now().strftime("%Y-%m-%d"),
+        "method": "Persistence and the weekly mean use only past prices. LEAR is fitted "
+                  f"once on the hours before the test start ({TEST_START}, train plus "
+                  "validation) and uses the wind forecast and mean temperature of its own "
+                  "zone from the feature table of step 14. Every test hour with a "
+                  "prediction is scored.",
+        "units": {
+            "MAE": "EUR/MWh",
+            "RMSE": "EUR/MWh",
+            "sMAPE_pct": "%",
+            "DirAcc_pct": "% of hours where the sign of the hour-on-hour change is right",
+            "R2": "coefficient of determination",
+        },
+        "models": {
+            "persistence_24h": "Persistence naive: the price of the same hour on the "
+                               "previous day (lag 24 h).",
+            "weekly_mean_4w": "Weekly seasonal mean: average of the same hour and weekday "
+                              "over the previous 4 weeks.",
+            "lear": "LEAR: linear ARX model with Ridge regularisation, using the wind and "
+                    "temperature of its own zone (zone-aware).",
+        },
+        "notes": "rMAE_vs_persistence_24h is MAE / MAE of persistence_24h for the same "
+                 "zone, rounded to 3 decimals.",
+        "zones": {z: zones[z] for z in sorted(zones, key=_zone_order)},
+    }
+    return write_json(path, out, ndigits=None)
 
 
 # ── Punto de entrada ──────────────────────────────────────────────────────────

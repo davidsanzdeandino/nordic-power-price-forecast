@@ -1,8 +1,9 @@
 # Registro de Decisiones Técnicas
 
 **Proyecto:** Nordic day-ahead price forecast — Pipeline de predicción de precios Nord Pool  
-**Última actualización:** junio de 2026  
-**Formato:** Cada decisión documenta qué se decidió, qué alternativas había y por qué se eligió esa opción.
+**Última actualización:** octubre de 2026  
+**Formato:** Cada decisión documenta qué se decidió, qué alternativas había y por qué se eligió esa opción.  
+**Note (English):** chronological log, mostly in Spanish (DT-23 and DT-24 are in English). Figures in older entries were superseded by later ones; the current numbers are in `README.md` and `results/`.
 
 ---
 
@@ -66,6 +67,8 @@
 - **(C) Imputación con modelo:** Innecesario para huecos tan pequeños y añade complejidad.
 
 **Razonamiento:** Los huecos de 1-3h en ENTSO-E son típicamente fallos temporales de comunicación, no ausencias de datos reales. La interpolación lineal es una aproximación razonable. Huecos >6h son sospechosos (posible mantenimiento del sistema, problema de API) y no deben inventarse.
+
+**Nota (2026-10-30):** en pandas, `interpolate(limit=3)` y `ffill(limit=3)` rellenan las primeras horas de cualquier hueco, también de los largos: las 3 primeras se interpolan hacia el siguiente valor observado y las 3 siguientes repiten el último valor rellenado; el resto del hueco queda en NaN. En 165 celdas del master ese siguiente valor es de un día de entrega posterior (eólica y solar ENTSO-E de DK1 y DK2, 36 en el test). Su efecto medido en el MAE servido está en DT-24 y en las Limitations del README.
 
 ---
 
@@ -262,7 +265,7 @@ Se amplió la ventana de datos de 2023-2024 a **2023-01 → 2026-05** (29.928 h)
   reciente; elimina el problema del test envejecido).
 - **Gates de validación (todos OK):** grid horario completo (0 huecos/duplicados),
   precios DK1/DK2 sin nulos, máx. correlación feature↔precio mismo-ts = 0.81
-  (forecast alemán, sin leakage), lags causales.
+  (forecast alemán; este control no detecta fugas por hora de publicación, ver DT-24), lags causales.
 - **Resultado (test 2026):** MAE DK1 **14.8** / DK2 **17.1**; DirAcc **82%**;
   R² **0.81**/0.75; **+34% vs LEAR** (DK1 34%, DK2 35%, LEAR zone-aware — ver DT-19);
   batería capta **92-93%** del oráculo. Mejora real y, sobre todo, evaluación **actual**
@@ -319,8 +322,9 @@ criterio del proyecto: *el valor no es solo si baja el MAE, sino si la fuente es
 robusta y profesional*. Fingrid cumple ambas.
 
 - **Datos (gratis):** `src/extract/09_fingrid_fi.py` añade aditivamente al master las
-  **previsiones day-ahead propias de Fingrid** ("updated once a day" → publicadas antes
-  de la subasta, leakage-safe): carga (165), eólica (246), solar (247) y el forecast del
+  **previsiones day-ahead propias de Fingrid** ("updated once a day", publicadas antes
+  de la subasta pero para el día finlandés, cuya primera hora es la última hora CET del
+  día anterior; esa hora se corrigió más tarde, ver DT-24): carga (165), eólica (246), solar (247) y el forecast del
   esquema de protección de **Olkiluoto-3** (372). Cobertura 99,9-100% desde 2023 (OL3 40%,
   dataset reciente). Suscripción gratuita "Open Data starter" → `FINGRID_API_KEY` en `.env`.
 - **Robustez del extractor:** la paginación del API de Fingrid es inconsistente (capa a
@@ -329,7 +333,7 @@ robusta y profesional*. Fingrid cumple ambas.
   → horario.
 - **Features (`add_fingrid_features`):** residual load propio del TSO, penetración eólica,
   lag 24h, y **desacuerdo de previsión Fingrid-vs-ENTSO-E** (señal de incertidumbre del
-  sistema). Todas day-ahead → sin leakage. **224 features** (FI; DK 166).
+  sistema). Todas day-ahead (salvo la última hora CET de cada día, corregida en DT-24). **224 features** (FI; DK 166).
 - **Resultado — doble lectura honesta:**
   - **MAE servido FI: 21,4 → 21,05** (mejor, no solo neutro); vs LEAR **−7,6** (LEAR
     zone-aware, ver DT-19); todos los regímenes mejoran (negativos 4,7→3,3; frío 29,1→28,6).
@@ -343,10 +347,10 @@ robusta y profesional*. Fingrid cumple ambas.
 
 ---
 
-## DT-19 · Auditoría exhaustiva + LEAR zone-aware (corrección de honestidad)
+## DT-19 · Auditoría exhaustiva + LEAR zone-aware (corrección del baseline)
 
 Auditoría del proyecto (investigación del mercado finlandés + revisión de código:
-leakage, consistencia, rigor ML). **Conclusión principal: no hay leakage ni "trampas"** —
+leakage, consistencia, rigor ML). **Conclusión principal: no se encontró leakage** (una revisión posterior sí lo encontró; ver DT-24) —
 el método se verificó sólido (walk-forward gold-standard, conformal out-of-sample, LEAR
 estándar de Lago et al., DM test, auditoría anti-leakage). Pero se encontró **un sesgo de
 baseline** que se corrigió:
@@ -508,6 +512,61 @@ A review of the code before publication found four defects, now fixed. The first
 - **Energi Data Service duplicates.** The datasets `Elspotprices`, `ElectricityBalanceNonv` and `ProductionConsumptionSettlement` hold one row per zone (`PriceArea`) and hour. `process_and_save` in `src/extract/04_energinet_dk.py`, and `remove_duplicates` in `src/transform/cleaning.py`, dropped duplicates by timestamp alone, so only one zone survived each hour. In the June 2026 run that zone was DK2: `Elspotprices` kept 24,094 DK2 rows, `price_DK1` came from ENTSO-E for the whole period and `price_DK2` from Energi Data Service up to 30 September 2025 (ENTSO-E after that). Over those hours the two sources agree on DK2 to within 0.0001 €/MWh. The Danish balance columns kept 744 hours (DK1) and 1 hour (DK2), and the settlement columns DK2 only; none of them is a model feature (the models read only `feat_*` columns and the calendar flags `is_weekend` and `is_holiday*`; none of the `feat_*` columns is built from the Energinet balance or settlement data), so the published forecasts do not change. Both functions now deduplicate by timestamp and `PriceArea`.
 
 Effect: the day-ahead backtest barely moves (share of perfect foresight 92.6% DK1, 92.1% DK2, 74.9% FI). The Battery Lab figures change: perfect-foresight ceiling in Finland 461.1 / 408.8 / 223.1 / 96.4 thousand EUR per MW (2023 to 2026), and in the 2026 test window the causal stack earns 71.2 thousand EUR per MW gross, 88% of the 81.2 oracle, against 39.1 for day-ahead arbitrage alone. All current figures are in `results/battery_lab_fi.json` and `results/evaluation_test2026.json`; they replace the ones in DT-20.
+
+## DT-24 · Validation-only model choice, day-ahead AR by delivery day and inputs aligned to their publication times (2026-10-29)
+
+A review of the published version found that the test window had been used to choose and calibrate, and that some inputs reached the auction too early (commodity closes, interconnector flows, hydro reservoir levels and the last hour of each Fingrid forecast). This entry replaces what DT-15, DT-17 and DT-19 say about choosing the served model with a Diebold-Mariano test on the test window.
+
+**The protocol was revised after a first look at the test.** The first version chose LightGBM or the ensemble per zone with a Diebold-Mariano test on January to May 2026, fitted the split-conformal calibrator on the first half of that window and, in Denmark, served the LightGBM with the AR term fitted on the ensemble's residuals (the loader replaced one corrector with the other); both AR terms were fitted on residuals that were partly in sample. It reported a served MAE of 14.54 (DK1), 16.86 (DK2) and 21.05 (FI) EUR/MWh; the raw LightGBM scored 14.82, 17.14 and 25.85 (evaluation run of 5 June 2026 on an earlier feature table). The test has therefore been seen, and the README says so right below the headline figures and under Limitations.
+
+What the code does now:
+
+- **Splits and models.** Every served model is fitted on train only (up to 30 September 2025). The validation quarter (October to December 2025) is used for early stopping, the model choice, the AR term and the interval calibration. The test window is only scored, by `src/model/evaluate.py`, with the same prediction path as the dashboard (`predict_with_bands`).
+- **Model choice on validation.** A 2,000-tree LightGBM fitted on train against the diverse ensemble (train, early stopping on validation). Rule written before scoring: the lower validation MAE wins; if LightGBM wins without significance (Diebold-Mariano, p >= 0.05) the ensemble is served. The result is in `results/training_<zone>.json`.
+- **Day-ahead AR by delivery day.** For each delivery day D (local day in Europe/Copenhagen) the AR offsets use residuals up to 23:00 on D-1 only (`day_ahead_offsets` in `src/model/ar_correction.py`), with steps counted from local midnight, so 23- and 25-hour days are handled. The previous code split the window into 24-row UTC blocks, whose last residual (23:00 UTC) is already an hour of D, and the served path applied the AR once at the start of the window. Whether the AR term is used is decided out of sample on validation (fit on October, score November; fit on October and November, score December); the final term is then fitted on the whole quarter. The in-sample correctors `ar_corrector_<zone>.pkl` and `ar_corrector_ensemble_<zone>.pkl` are no longer produced.
+- **Early stopping.** The point LightGBM uses 2,000 trees as a declared hyperparameter, with no evaluation set (before, the evaluation set was part of the training data and stopping never triggered). The quantile models are fitted on train with early stopping on validation, with no refit on train plus validation. The 2,000-tree LightGBM on train plus validation is kept only as a comparator and for SHAP.
+- **Intervals.** The split-conformal calibrator is fitted on validation and its coverage is measured on the whole test window. Adaptive conformal inference uses a daily update: the multiplier is constant within a delivery day and is updated with the errors of that day once it closes (gamma fixed at 0.03, not tuned).
+- **Quantile order (added 2026-10-30).** The served P10, P25, P50, P75 and P90 bands are sorted in each hour after the conformal step (`sort_quantile_bands` in `src/model/conformal.py`, called by `predict_with_bands`), because the separately fitted quantile models crossed. The point forecast does not go through it. Effect in the note after the table.
+- **Inputs at the auction.** Gas (TTF) and carbon closes and the interconnector utilisation now use a 48-hour lag: the daily close of D-1 and the realised flows of D-1 after 12:00 arrive after the auction. The columns `feat_*_lag24h` of the commodity block are renamed `*_lag48h`.
+- **Hydro reservoirs.** The weekly ENTSO-E value is stamped at the start of its week (Monday 00:00 CET) and carried forward in the master table, and Regulation 543/2013, art. 16.2(d), allows it to be published as late as the third working day after the week: the Friday of the following week when that week has two weekday holidays. The one-week lag let the Monday after a week use it before the week had ended. The lag is now 13 days (`RESERVOIR_LAG` = 312 hours in `src/model/features.py`), so a week's value is first used for the Sunday of the following week, whose auction closes on Saturday at 12:00; 12 days (288 hours) would not cover the Friday deadline. If 24 December also counted as a non-working day, the Christmas weeks of 2024 and 2025 (training and validation, not the test window) would have their deadline on the following Monday, after that Sunday, so on three delivery days (29–31 December 2024 and 28–30 December 2025) the auction could close before the value was due. The level, its 4-week change and the anomaly all use this lag, and the columns `feat_reservoir_*_lag1w` are renamed `*_lag13d`.
+- **Fingrid forecasts.** The dataset pages on data.fingrid.fi give 12:00 EET on D-1 for the load (165), wind (246) and solar (247) forecasts, read here as Finnish local time (11:00 CET), and 10:00 for the Olkiluoto 3 forecast (372), updated from 11:00 with the capacity reserved for maintenance; each covers the next Finnish day. The master table stores them by UTC hour, so the last CET hour of delivery day D (00:00–01:00 Finnish time on D+1) came from the forecast published on day D, after the auction. That hour now takes the value of the hour before it (one hour per delivery day, 1,247 of the 29,928 hours). The 24-hour lag of the Fingrid residual load keeps the original series, which was published before the auction.
+- **Training-only statistics.** The REMIT thresholds and normalisations, the seasonal normal of the reservoir anomaly (mean by ISO week, previously computed on all rows) and the value that fills missing load forecasts in the residual load (previously the median of all rows) use training rows only. Missing feature values are filled with training medians (stored with the model).
+- **Statistics.** One Diebold-Mariano implementation (`src/model/dm.py`): HAC variance with Bartlett weights (h = 24), Harvey-Leybourne-Newbold correction and Student t. The test-window tests are labelled descriptive.
+- **Reproducibility.** The Optuna hyperparameters are frozen in `src/model/best_params.json`; `run_pipeline.py --optuna` searches again. LightGBM runs with `deterministic=True` and the thread count from `LGBM_N_JOBS`; the published run used `LGBM_N_JOBS=4` and `OMP_NUM_THREADS=4`. The published result files are written by code: `results/training_<zone>.json`, `results/evaluation_test2026_<zone>.json`, `results/baselines_test2026.json` (`src/model/baselines.py`, steps 15–17), `results/model_selection_val2025.json`, `results/evaluation_test2026.json` (`scripts/build_results.py`), `results/fi_regimes_test2026.json`, `results/leakage_sensitivity_test2026.json` and `results/battery_lab_fi.json` (`checks/test_revenue_stacking.py --write` and `checks/test_battery_lab_data.py --write`).
+
+Not fixed: the publication time of the ENTSO-E wind and solar forecasts (legally due by 18:00 on D-1, not stored by the API), whether Fingrid revises its forecasts after their publication on D-1 (the API does not store revisions either), the 11:00 update of the Olkiluoto 3 forecast and whether "EET" means 12:00 CEST in summer, the lead time of the Open-Meteo Historical Forecast data, the REMIT publication time, the Finnish scheduled exchanges (ENTSO-E total schedules, contract type A05, which include intraday trades; the Danish ones are day-ahead, A01), the cleaning fill of gaps towards a later observation (DT-05) and the 25-hour day at the end of October, whose last hour takes as its 24-hour lag the first hour of the same day (lags are counted in hours; two hours in train, one in validation, none in the test window). `scripts/leakage_sensitivity.py` measures a conservative variant for the wind and solar forecasts (ENTSO-E and Fingrid), the Open-Meteo data and REMIT. Tests: `tests/test_day_ahead_ar.py`, `tests/test_dm.py`, `tests/test_train_protocol.py`, `tests/test_features_publication.py` (reservoir lag, Fingrid last hour, training-only reservoir normal and load fill), `tests/test_quantile_sorting.py`, and new cases in `tests/test_conformal_coverage.py` and `tests/test_features_leakage.py`.
+
+**Result (steps 14 to 30, 2026-10-29, same master table, baselines identical to the thousandth).** The revised protocol was first run without the reservoir lag, the Fingrid last-hour substitution and the training-only reservoir normal and load fill: served MAE 15.93 / 17.11 / 21.33, with the AR term kept in DK2 (validation 13.36 → 13.29; the result files of that run were overwritten by the second run and are not in the repository). Those fixes came from a review of publication times made after that run; their effect on the test was not measured separately, steps 14 to 30 were run once more, and that second run is published here as it came out. On 2026-10-30 steps 21 to 30 were run again with the quantile bands sorted per hour, without retraining; only the interval figures changed (note after the table).
+
+- Model choice on validation: the ensemble in all three zones. Validation MAE, ensemble against the 2,000-tree LightGBM fitted on train: 12.08 vs 15.77 (DK1, DM −3.67, p = 0.0003), 13.20 vs 15.30 (DK2, DM −2.31, p = 0.02), 16.94 vs 24.00 (FI, DM −6.01, p < 0.0001).
+- AR decision on validation (scored months, raw MAE → with AR): DK1 11.18 → 11.41, DK2 13.29 → 13.39, FI 15.41 → 16.70, rejected in all three zones. The rule was not changed after seeing this; in the first run of the revised protocol (above) the AR term had been kept in DK2 only.
+- Served models: the diverse ensemble in all three zones, without the AR term.
+
+| Test window (DK1 / DK2 / FI) | First version | DT-24 |
+|---|---|---|
+| Served MAE (EUR/MWh) | 14.54 / 16.86 / 21.05 | 15.93 / 18.92 / 21.45 |
+| Change vs 24-hour persistence | −45.5 / −44.6 / −38.8% | −40.3 / −37.8 / −37.6% |
+| Change vs linear ARX (LEAR-style) | −35.5 / −35.8 / −26.6% | −29.3 / −28.0 / −25.2% |
+| RMSE | 19.91 / 25.70 / 37.63 | 21.40 / 28.89 / 37.57 |
+| R² | 0.82 / 0.76 / not computed | 0.79 / 0.69 / 0.72 |
+| Mean bias (forecast − actual) | not published | −11.4 / −14.2 / −10.4 |
+| Raw LightGBM, train plus validation | 14.82 / 17.14 / 25.85 | 15.23 / 17.96 / 26.49 |
+| P10–P90 coverage, raw bands | 37.1 / 35.4 / 55.0% | 57.7 / 49.2 / 78.2% |
+| P10–P90 coverage, split-conformal | 81.5 / 79.3 / 74.0% (fitted on the first half of the test, scored on the second) | 62.7 / 60.8 / 81.5% (fitted on validation, scored on the whole test, quantiles sorted per hour) |
+| P10–P90 coverage, ACI | 78.4 / 78.3 / 78.0% (hourly update) | 79.3 / 79.3 / 79.6% (daily update) |
+| Pinball / CRPS | 5.83 / 7.35 / 8.28 · 11.66 / 14.70 / 16.57 | 5.46 / 7.09 / 8.07 · 10.92 / 14.17 / 16.14 |
+| Hours with crossed quantiles in the served bands | not measured (not sorted) | 0 (475 / 442 / 755 before sorting) |
+| Battery LP, share of perfect foresight | 92.6 / 92.1 / 74.9% (evaluation-stage ensemble + AR) | 94.6 / 94.5 / 78.0% (served forecast) |
+| Battery LP driven by persistence | not measured | 83.5 / 81.8 / 58.1% |
+| Walk-forward LightGBM, mean monthly MAE | 14.50 / 15.53 / 22.00 | 14.60 / 15.50 / 22.45 |
+
+Quantile sorting (2026-10-30, steps 21 to 30 run again, no retraining). Before → after, DK1 / DK2 / FI: split-conformal P10–P90 coverage 62.5 / 60.5 / 80.5% → 62.7 / 60.8 / 81.5%; P25–P75 coverage 35.7 / 34.4 / 47.2% → 35.9 / 34.4 / 47.4%; mean P10–P90 width 37.7 / 45.7 / 70.7 → 37.8 / 45.9 / 71.1 EUR/MWh; pinball 5.47 / 7.10 / 8.10 → 5.46 / 7.09 / 8.07; CRPS 10.94 / 14.20 / 16.20 → 10.92 / 14.17 / 16.14. The point forecasts, MAE, RMSE, Diebold-Mariano tests, battery backtests, Battery Lab and ACI (computed on the P10 and P90 before the conformal step, which the sorting does not touch) are unchanged to the last digit. The "before" values are kept in `results/evaluation_test2026_<zone>.json` (`conformal.*_before_sorting`). The CRPS approximated with 5 quantiles is twice the mean pinball loss, so its "before" value is 2 × `pinball_loss_before_sorting`.
+
+Battery Lab, Finland, test window, generic 1 MW / 2 MWh battery: causal stack 71.2 → 70.7 thousand EUR per MW gross, oracle 81.2 → 81.4 (the oracle also follows the day-ahead forecast), day-ahead only 39.1 → 39.7. The yearly perfect-foresight ceiling does not change.
+
+On the test window the served ensemble is worse in Denmark than the 2,000-tree LightGBM fitted on train plus validation (DK1 15.93 vs 15.23, DM +2.98, p = 0.003; DK2 18.92 vs 17.96, DM +3.45, p = 0.0006), and in DK2 also worse than the LightGBM fitted on train only that validation rejected (17.48). In FI the served model is better than that LightGBM (DM −3.18, p = 0.0015). These test-window tests are descriptive and do not change the choice.
+
+Measured effect of what is not fixed (change in served test MAE, DK1 / DK2 / FI, `results/leakage_sensitivity_test2026.json`): Open-Meteo previous-day run +0.08 / +0.08 / −0.02 and two-days-before run +0.09 / −0.06 / +0.02; REMIT frozen at 11:00 CET on D-1 +0.02 / +0.02 / −0.03; wind and solar forecasts replaced by those of the previous day (pessimistic bound, it measures dependence on those forecasts, not the leak) +10.1 / +11.0 / +13.0. Measured later with the same path (copy of the master table, variant, features, served models, no retraining), not part of the script's output: Fingrid load, wind and solar forecasts on the summer-time days of the test window (the 1,535 summer-time hours from 29 March, about one delivery day more than needed since the first day published in summer time is 30 March, when a fixed-UTC+2 reading of 12:00 EET would be the gate closure itself) replaced by ENTSO-E's forecasts for Finland, FI +0.08, or by Fingrid's forecasts of the previous day, FI +1.68 (pessimistic bound); Olkiluoto 3 forecast of the previous day, FI −0.01; Finnish scheduled exchanges of D-1 from 12:00 CET replaced by those of D-2, FI +0.01 (+0.001 with a 48-hour lag in every hour); the 165 gap-filled cells that use a later delivery day replaced by the last observation before the gap, +0.004 / +0.008 / +0.0006 (21, 22 and 6 test hours change).
 
 ---
 

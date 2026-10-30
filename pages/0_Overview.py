@@ -83,7 +83,8 @@ with st.sidebar:
 
     st.divider()
     st.caption("Data: ENTSO-E · Energinet/Fingrid · Open-Meteo · Yahoo Finance")
-    st.caption("Model: LightGBM + AR (DK) · diverse ensemble + AR (FI) | Train: 2023 → Sep-2025")
+    st.caption("Model: chosen per zone on the Oct–Dec 2025 validation quarter | "
+               "Train: 2023 → Sep-2025")
     st.caption("Test: Jan–May 2026 (out-of-sample)")
 
     with st.popover("How to read this dashboard"):
@@ -92,8 +93,8 @@ with st.sidebar:
             "(DK1/DK2) and Finland (FI) — separate models.\n"
             "- **Price zone**: the modeled zone, or a neighbour shown for coupling context.\n"
             "- **Forecast** = the model's day-ahead price prediction (€/MWh) for each hour.\n"
-            "- **Bands (P10–P90)** = an 80% confidence interval — the price is expected to "
-            "land inside ~4 times out of 5.\n"
+            "- **Bands (P10–P90)** = a nominal 80% interval; on the Jan–May 2026 test it held "
+            "62.7% (DK1), 60.8% (DK2) and 81.5% (FI) of prices.\n"
             "- The **green banner** confirms you are seeing *real* pipeline results, not a demo.\n"
             "- Other pages (left): market patterns, hour-by-hour forecast, € value, technical "
             "docs, battery lab and transparency."
@@ -105,12 +106,15 @@ zone_fc = zone if is_modeled else country["default_zone"]
 # ── Header ────────────────────────────────────────────────────────────────────
 
 st.title(f"{country_name} Electricity Price Forecast")
-served_model = ("diverse LightGBM ensemble (L2 + median + Huber) + AR correction"
-                if zone_fc == "FI" else "LightGBM + AR correction")
+model_meta = load_model_summary(zone=zone_fc)
+served_model = (model_meta.get("production_model")
+                or model_meta.get("served_label") or "the served model")
 st.markdown(
     f"**Day-ahead price prediction for zone {zone_fc}** — "
-    f"{served_model}, trained on 2023 → Sep-2025 and tested out-of-sample on "
-    f"Jan–May 2026; key drivers: {country['drivers']}."
+    f"{served_model}, trained on 2023 → Sep-2025, with the Oct–Dec 2025 "
+    f"validation quarter used for model choice, the AR term and interval "
+    f"calibration, and tested out-of-sample on Jan–May 2026; key drivers: "
+    f"{country['drivers']}."
 )
 
 # Aviso: datos reales vs modo demo
@@ -122,7 +126,6 @@ with st.spinner("Loading data..."):
     df_pred    = load_predictions(zone=zone_fc, days=days_to_show)
     df_prices  = load_price_data()
     df_fi      = load_feature_importance(zone=zone_fc, top_n=5)
-    model_meta = load_model_summary(zone=zone_fc)
     stats      = get_market_stats(zone=zone_fc)
 
 # ── KPIs ──────────────────────────────────────────────────────────────────────
@@ -154,7 +157,7 @@ with k2:
             delta=band_str,
             delta_color="off",
             help="The model's predicted price for the next hour, with its P10–P90 "
-                 "confidence band (80% interval).",
+                 "band (nominal 80% interval; README, Limitations).",
         )
     else:
         st.metric("Next period forecast", "—")
@@ -162,18 +165,22 @@ with k2:
 with k3:
     mae = model_meta.get("MAE_test")
     # Baseline de persistencia real si está disponible en los metadatos
-    mae_persist = model_meta.get("MAE_persistence")
+    mae_persist = model_meta.get("MAE_persistence_24h")
+    vs_lear = model_meta.get("MAE_change_vs_lear_pct")
     if isinstance(mae, (int, float)):
         delta = (f"vs persistence: {mae_persist:.1f}"
                  if isinstance(mae_persist, (int, float)) else None)
+        lear_txt = (f" {abs(vs_lear):.0f}% {'below' if vs_lear < 0 else 'above'} the "
+                    f"LEAR linear benchmark in this zone."
+                    if isinstance(vs_lear, (int, float)) else "")
         st.metric(
             label="Model MAE (test)",
             value=f"{mae:.1f} €/MWh",
             delta=delta,
             delta_color="off",
-            help="Mean Absolute Error on the out-of-sample test set (Jan–May 2026): "
-                 "on average the forecast is off by this many €/MWh. Lower is better. "
-                 "Beats the LEAR linear benchmark by ~36% in DK1/DK2 and ~27% in FI.",
+            help="Mean Absolute Error of the served forecast on the out-of-sample "
+                 "test set (Jan–May 2026): on average the forecast is off by this "
+                 "many €/MWh. Lower is better." + lear_txt,
         )
     else:
         # Sin MAE real: no inventar nada
@@ -204,7 +211,8 @@ with hc2.popover("What am I seeing?"):
     st.markdown(
         "The **line** is the model's day-ahead forecast; the **dots/line of actuals** "
         "is the price that really cleared. The **shaded area** is the P10–P90 band "
-        "(80% confidence). When actuals stay inside the band and hug the forecast, "
+        "(nominal 80%; 61–63% in Denmark and 81% in Finland on the test). When actuals "
+        "stay inside the band and hug the forecast, "
         "the model is working. Gaps appear at price **spikes** — the hardest moments "
         "to predict."
     )

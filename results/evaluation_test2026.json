@@ -1,412 +1,581 @@
 {
-  "description": "Out-of-sample evaluation on the test window (January to May 2026, hourly, UTC) for DK1, DK2 and FI.",
+  "description": "Out-of-sample evaluation on the test window (January to May 2026, hourly, UTC). The served model, the AR term and the interval calibration were fixed on the October-December 2025 validation quarter; the test window is only scored.",
+  "generated_by": "scripts/build_results.py",
+  "generated_on": "2026-10-30",
+  "sources": [
+    "results/evaluation_test2026_<zone>.json (src/model/evaluate.py)",
+    "data/metadata/served_metrics_<zone>.json (scripts/gen_served_metrics.py)",
+    "results/training_<zone>.json (src/model/train.py)",
+    "results/baselines_test2026.json"
+  ],
   "test_period": {
-    "start_utc": "2026-01-01T00:00:00Z",
-    "end_utc": "2026-05-31T23:00:00Z",
-    "hours": 3624
+    "start_utc": "2026-01-01",
+    "end_utc": "2026-05-31 23:00"
   },
   "units": {
     "MAE, RMSE, pinball, CRPS, prices": "EUR/MWh",
     "battery profit": "EUR per year, annualised from the test window",
     "DirAcc_pct": "% of hours where the sign of the hour-on-hour change is right"
   },
-  "sources": "Each block names its source file. Log values are copied as printed by src/model/evaluate.py; the logs are not published because they contain local paths. The served-model metrics are the published data/metadata/served_metrics_*.json and the baselines are in results/baselines_test2026.json. The battery backtest blocks and the LEAR row check were recomputed on 2026-10-23 with the code of this repository (see each block).",
   "zones": {
     "DK1": {
       "served_model": {
-        "source": "data/metadata/served_metrics_DK1.json (written by scripts/gen_served_metrics.py on 2026-06-10)",
-        "production_model": "LightGBM + AR",
+        "source": "data/metadata/served_metrics_DK1.json (scripts/gen_served_metrics.py)",
+        "label": "Diverse ensemble (L2 + median + Huber)",
+        "served_model": "ensemble",
+        "use_ar": false,
         "n_hours": 3624,
-        "MAE": 14.536,
-        "RMSE": 19.913,
-        "DirAcc_pct": 82.61,
-        "R2": 0.8178
+        "MAE": 15.93,
+        "RMSE": 21.399,
+        "DirAcc_pct": 83.88,
+        "R2": 0.7896,
+        "mean_forecast_minus_actual": -11.381,
+        "MAE_pct_of_mean_price": 16.5,
+        "check_equals_evaluate_served_row": true
       },
       "served_model_vs_baselines": {
-        "source": "Derived from the served MAE above and results/baselines_test2026.json (MAE of persistence_24h and lear).",
+        "source": "served MAE above and results/baselines_test2026.json",
         "MAE_persistence_24h": 26.693,
         "MAE_lear": 22.542,
-        "rMAE_vs_persistence_24h": 0.545,
-        "MAE_change_vs_persistence_24h_pct": -45.5,
-        "MAE_change_vs_lear_pct": -35.5
+        "rMAE_vs_persistence_24h": 0.597,
+        "rMAE_vs_lear": 0.707,
+        "MAE_change_vs_persistence_24h_pct": -40.3,
+        "MAE_change_vs_lear_pct": -29.3
       },
-      "evaluation_run": {
-        "source": "evaluate_DK1_20260605.log, last run in the file (started 2026-06-05 15:19:01). Earlier runs in the same log used an older test window and are not used.",
-        "features": 166,
-        "note": "Models as scored by src/model/evaluate.py on the earlier feature table. The served-model block above was measured later on the final table, so the numbers differ slightly. The baseline rows of this run are not copied: the run predates the fix of 2026-10-23, and in DK2 and FI its LEAR row was fitted on DK1 wind and temperature. Baselines are in results/baselines_test2026.json.",
-        "models": {
-          "LightGBM": {
-            "MAE": 14.821,
-            "RMSE": 20.195,
-            "sMAPE_pct": 27.89,
-            "DirAcc_pct": 82.4,
-            "R2": 0.8126
-          },
-          "LightGBM+AR_DA": {
-            "MAE": 14.841,
-            "RMSE": 20.238,
-            "sMAPE_pct": 27.57,
-            "DirAcc_pct": 81.9,
-            "R2": 0.8091
-          },
-          "Ensemble": {
-            "MAE": 15.863,
-            "RMSE": 21.326,
-            "sMAPE_pct": 29.32,
-            "DirAcc_pct": 84.4,
-            "R2": 0.791
-          },
-          "Ensemble+AR_DA": {
-            "MAE": 14.335,
-            "RMSE": 20.221,
-            "sMAPE_pct": 27.18,
-            "DirAcc_pct": 82.4,
-            "R2": 0.8094
-          }
+      "comparators_raw": {
+        "source": "results/evaluation_test2026_DK1.json (src/model/evaluate.py)",
+        "note": "raw models without the AR term; LightGBM is the 2,000-tree model fitted on train plus validation, LightGBM_train the one fitted on train only (the selection candidate)",
+        "LightGBM": {
+          "n_obs": 3624.0,
+          "MAE": 15.228,
+          "RMSE": 20.73,
+          "sMAPE": 29.081,
+          "DirAcc": 82.06,
+          "R2": 0.8025
         },
-        "lear_row_recomputed": {
-          "source": "src/model/evaluate.py (compute_all_metrics) re-run on 2026-10-23 on the local feature table, with LEARBaseline(alpha=0.1, zone=DK1); identical to the lear row of results/baselines_test2026.json",
-          "MAE": 22.542,
-          "RMSE": 29.147,
-          "sMAPE_pct": 36.84,
-          "DirAcc_pct": 80.07,
-          "R2": 0.6096
+        "LightGBM_train": {
+          "n_obs": 3624.0,
+          "MAE": 16.345,
+          "RMSE": 21.52,
+          "sMAPE": 30.827,
+          "DirAcc": 81.89,
+          "R2": 0.7872
+        },
+        "Ensemble": {
+          "n_obs": 3624.0,
+          "MAE": 15.93,
+          "RMSE": 21.399,
+          "sMAPE": 29.241,
+          "DirAcc": 83.88,
+          "R2": 0.7896
         }
       },
-      "diebold_mariano": {
-        "source": "evaluate_DK1_20260605.log, run of 2026-06-05 15:19:12",
-        "comparison": "diverse ensemble vs single LightGBM, absolute loss, both without AR correction",
-        "DM": 8.67,
-        "p_value_as_logged": 0.0,
-        "p_value_note": "The log prints p with 3 decimals (0.000), so p < 0.001.",
-        "better_model": "LightGBM"
+      "mean_forecast_minus_actual": {
+        "served": -11.3805,
+        "lgbm": -11.0515,
+        "lgbm_train": -11.3289,
+        "ens": -11.3805
+      },
+      "diebold_mariano_test": {
+        "label": "descriptive, test",
+        "method": "absolute loss, HAC variance (Newey-West, Bartlett weights, h=24), Harvey-Leybourne-Newbold correction, Student t(n-1)",
+        "convention": "DM < 0 means the first model is more accurate",
+        "served_vs_lightgbm": {
+          "DM": 2.9787,
+          "p_value": 0.0029,
+          "n": 3624,
+          "better": "lgbm"
+        },
+        "served_vs_lear": {
+          "DM": -9.3634,
+          "p_value": 0.0,
+          "n": 3624,
+          "better": "served"
+        },
+        "ensemble_vs_lightgbm": {
+          "DM": 2.9787,
+          "p_value": 0.0029,
+          "n": 3624,
+          "better": "lgbm"
+        }
       },
       "interval_coverage_P10_P90": {
-        "target_pct": 80.0,
-        "bands": "LightGBM quantile models (P10, P25, P75, P90)",
-        "static_full_test_pct": 37.1,
-        "aci_full_test_pct": 78.4,
-        "static_and_aci_source": "evaluate_DK1_20260605.log, run of 2026-06-05 15:19:12",
-        "aci_method": "Adaptive conformal inference (Gibbs and Candes, 2021), target 0.80, gamma 0.03, updated online over the whole test window.",
         "split_conformal": {
-          "source": "evaluate_DK1_20260605.log, run of 2026-06-05 15:19:10",
-          "calibrated_on": "first half of the test window",
-          "measured_on_hours": 1812,
-          "P10_P90_raw_pct": 34.7,
-          "P10_P90_conformal_pct": 81.5,
-          "P25_P75_raw_pct": 19.6,
-          "P25_P75_conformal_pct": 48.2,
-          "P10_P90_width_raw_eur_mwh": 21.8,
-          "P10_P90_width_conformal_eur_mwh": 60.6
+          "calibrated_on": "validation quarter 2025-10-01 to 2025-12-31 23:00 (train.py)",
+          "measured_on": "whole test window, served bands",
+          "n_hours": 3624,
+          "P10_P90_before_conformal_pct": 57.6987,
+          "P10_P90_served_pct": 62.7483,
+          "P25_P75_before_conformal_pct": 32.2572,
+          "P25_P75_served_pct": 35.9272,
+          "P10_P90_width_before_conformal": 34.3212,
+          "P10_P90_width_served": 37.8366,
+          "quantiles_sorted_per_hour": true,
+          "hours_with_crossed_quantiles_before_conformal": 631,
+          "hours_with_crossed_quantiles_before_sorting": 475,
+          "hours_with_crossed_quantiles_served": 0,
+          "P10_P90_before_sorting_pct": 62.4724,
+          "P25_P75_before_sorting_pct": 35.7064,
+          "P10_P90_width_before_sorting": 37.6974,
+          "pinball_loss_before_sorting": 5.4687
+        },
+        "aci_daily": {
+          "coverage_static": 0.577,
+          "coverage_aci": 0.793,
+          "target": 0.8,
+          "width_static_mean": 34.3212,
+          "width_aci_mean": 52.5892,
+          "k_final": 1.756,
+          "k_mean": 1.5207,
+          "gamma": 0.03,
+          "update": "daily",
+          "bands": "served P10-P90 before the conformal step",
+          "k0": 1.0,
+          "gamma_note": "fixed, not tuned"
         }
       },
       "probabilistic_scores": {
-        "source": "evaluate_DK1_20260605.log, run of 2026-06-05 15:19:12",
-        "pinball_loss_eur_mwh": 5.828,
-        "crps_approx_eur_mwh": 11.655,
-        "crps_note": "Approximated from 5 quantiles."
+        "pinball_loss": 5.4586,
+        "crps_approx": 10.9172,
+        "n_quantiles": 5,
+        "bands": "served (conformal)"
       },
       "battery_backtest": {
-        "source": "Recomputed on 2026-10-23 with the battery backtest call of src/model/evaluate.py (battery_arbitrage_backtest, method lp) on the local feature table and the evaluation models, after the fix that limits charge plus discharge to the power rating in every hour. It replaces the figures of evaluate_DK1 (June 2026), which lacked that limit.",
-        "setup": "1 MW / 2 MWh, round-trip efficiency 0.90, daily linear program (src/model/battery_backtest.py, method lp) with charge plus discharge at most 1 MW in every hour, settled at actual prices, annualised from the test window.",
-        "forecast_used": "Ensemble+AR_DA as computed by src/model/evaluate.py (diverse ensemble with day-ahead AR correction)",
-        "days": 149,
-        "profit_forecast_eur_per_year": 68555,
-        "profit_perfect_foresight_eur_per_year": 74033,
-        "share_of_perfect_foresight_pct": 92.6,
-        "profit_fixed_schedule_eur_per_year": 8661,
-        "uplift_vs_fixed_schedule_eur_per_year": 59895,
-        "fixed_schedule": "charge 00:00-02:00, discharge 17:00-19:00, Copenhagen time"
+        "setup": "1 MW / 2 MWh, round-trip efficiency 0.90, daily linear program (src/model/battery_backtest.py, method lp), settled at actual prices, annualised from the test window",
+        "served_forecast": {
+          "n_days": 149,
+          "method": "lp",
+          "capacity_mwh": 2.0,
+          "power_mw": 1.0,
+          "efficiency": 0.9,
+          "profit_perfect_total": 30221.8,
+          "profit_forecast_total": 28578.0,
+          "profit_naive_total": 3535.4,
+          "profit_perfect_annual": 74033.0,
+          "profit_forecast_annual": 70007.0,
+          "profit_naive_annual": 8661.0,
+          "pct_of_oracle_forecast": 94.6,
+          "pct_of_oracle_naive": 11.7,
+          "forecast_vs_naive_uplift_annual": 61346.0,
+          "forecast_used": "served"
+        },
+        "persistence_forecast": {
+          "profit_forecast_annual": 61843.0,
+          "pct_of_oracle_forecast": 83.5,
+          "n_days": 149
+        },
+        "served_minus_persistence_annual": 8164.0
       },
       "walk_forward_summary": {
-        "source": "evaluate_DK1_20260605.log, run of 2026-06-05 15:19:10; monthly folds in data/models/walkforward_DK1.csv",
+        "model": "LightGBM, 500 trees, expanding window, retrained monthly",
+        "note": "descriptive; not the served model and not used for any choice",
         "folds": 24,
         "first_month": "2024-06",
         "last_month": "2026-05",
         "MAE_monthly": {
-          "mean": 14.5,
-          "std": 2.91,
-          "min": 9.25,
-          "max": 22.73
-        },
-        "MAE_monthly_with_AR": {
-          "mean": 14.26,
-          "std": 3.0,
-          "min": 9.22,
-          "max": 23.04
+          "mean": 14.595,
+          "std": 3.0887,
+          "min": 8.644,
+          "max": 22.688
         }
       },
       "test_window_prices": {
-        "source": "data/master/dataset_master.parquet, column price_DK1 (computed 2026-10-23; the master table is not published)",
-        "n_hours": 3624,
-        "mean_eur_mwh": 96.595,
-        "std_eur_mwh": 46.658
+        "mean": 96.5948,
+        "std": 46.6577,
+        "n": 3624
+      },
+      "price_level_by_split": {
+        "source": "price_<zone> of data/master/dataset_features.parquet (step 14), split dates of src/model/config.py",
+        "train": {
+          "mean": 79.071,
+          "std": 50.7642,
+          "n_hours": 24096
+        },
+        "validation": {
+          "mean": 84.4001,
+          "std": 44.2128,
+          "n_hours": 2208
+        },
+        "test": {
+          "mean": 96.5948,
+          "std": 46.6577,
+          "n_hours": 3624
+        }
       }
     },
     "DK2": {
       "served_model": {
-        "source": "data/metadata/served_metrics_DK2.json (written by scripts/gen_served_metrics.py on 2026-06-10)",
-        "production_model": "LightGBM + AR",
+        "source": "data/metadata/served_metrics_DK2.json (scripts/gen_served_metrics.py)",
+        "label": "Diverse ensemble (L2 + median + Huber)",
+        "served_model": "ensemble",
+        "use_ar": false,
         "n_hours": 3624,
-        "MAE": 16.856,
-        "RMSE": 25.697,
-        "DirAcc_pct": 81.98,
-        "R2": 0.756
+        "MAE": 18.919,
+        "RMSE": 28.892,
+        "DirAcc_pct": 84.02,
+        "R2": 0.6916,
+        "mean_forecast_minus_actual": -14.225,
+        "MAE_pct_of_mean_price": 19.0,
+        "check_equals_evaluate_served_row": true
       },
       "served_model_vs_baselines": {
-        "source": "Derived from the served MAE above and results/baselines_test2026.json (MAE of persistence_24h and lear).",
+        "source": "served MAE above and results/baselines_test2026.json",
         "MAE_persistence_24h": 30.422,
         "MAE_lear": 26.273,
-        "rMAE_vs_persistence_24h": 0.554,
-        "MAE_change_vs_persistence_24h_pct": -44.6,
-        "MAE_change_vs_lear_pct": -35.8
+        "rMAE_vs_persistence_24h": 0.622,
+        "rMAE_vs_lear": 0.72,
+        "MAE_change_vs_persistence_24h_pct": -37.8,
+        "MAE_change_vs_lear_pct": -28.0
       },
-      "evaluation_run": {
-        "source": "evaluate_DK2_20260605.log, last run in the file (started 2026-06-05 15:19:14). Earlier runs in the same log used an older test window and are not used.",
-        "features": 166,
-        "note": "Models as scored by src/model/evaluate.py on the earlier feature table. The served-model block above was measured later on the final table, so the numbers differ slightly. The baseline rows of this run are not copied: the run predates the fix of 2026-10-23, and in DK2 and FI its LEAR row was fitted on DK1 wind and temperature. Baselines are in results/baselines_test2026.json.",
-        "models": {
-          "LightGBM": {
-            "MAE": 17.136,
-            "RMSE": 25.972,
-            "sMAPE_pct": 28.53,
-            "DirAcc_pct": 81.8,
-            "R2": 0.7507
-          },
-          "LightGBM+AR_DA": {
-            "MAE": 17.403,
-            "RMSE": 26.295,
-            "sMAPE_pct": 28.46,
-            "DirAcc_pct": 81.0,
-            "R2": 0.7413
-          },
-          "Ensemble": {
-            "MAE": 18.58,
-            "RMSE": 28.16,
-            "sMAPE_pct": 29.87,
-            "DirAcc_pct": 84.5,
-            "R2": 0.707
-          },
-          "Ensemble+AR_DA": {
-            "MAE": 17.071,
-            "RMSE": 27.214,
-            "sMAPE_pct": 27.51,
-            "DirAcc_pct": 83.1,
-            "R2": 0.7229
-          }
+      "comparators_raw": {
+        "source": "results/evaluation_test2026_DK2.json (src/model/evaluate.py)",
+        "note": "raw models without the AR term; LightGBM is the 2,000-tree model fitted on train plus validation, LightGBM_train the one fitted on train only (the selection candidate)",
+        "LightGBM": {
+          "n_obs": 3624.0,
+          "MAE": 17.964,
+          "RMSE": 27.024,
+          "sMAPE": 29.267,
+          "DirAcc": 81.84,
+          "R2": 0.7302
         },
-        "lear_row_recomputed": {
-          "source": "src/model/evaluate.py (compute_all_metrics) re-run on 2026-10-23 on the local feature table, with LEARBaseline(alpha=0.1, zone=DK2); identical to the lear row of results/baselines_test2026.json",
-          "MAE": 26.273,
-          "RMSE": 35.017,
-          "sMAPE_pct": 39.6,
-          "DirAcc_pct": 80.18,
-          "R2": 0.5469,
-          "MAE_before_fix_with_DK1_weather": 25.527
+        "LightGBM_train": {
+          "n_obs": 3624.0,
+          "MAE": 17.476,
+          "RMSE": 26.621,
+          "sMAPE": 29.393,
+          "DirAcc": 82.53,
+          "R2": 0.7381
+        },
+        "Ensemble": {
+          "n_obs": 3624.0,
+          "MAE": 18.919,
+          "RMSE": 28.892,
+          "sMAPE": 30.092,
+          "DirAcc": 84.02,
+          "R2": 0.6916
         }
       },
-      "diebold_mariano": {
-        "source": "evaluate_DK2_20260605.log, run of 2026-06-05 15:19:26",
-        "comparison": "diverse ensemble vs single LightGBM, absolute loss, both without AR correction",
-        "DM": 11.98,
-        "p_value_as_logged": 0.0,
-        "p_value_note": "The log prints p with 3 decimals (0.000), so p < 0.001.",
-        "better_model": "LightGBM"
+      "mean_forecast_minus_actual": {
+        "served": -14.225,
+        "lgbm": -13.1163,
+        "lgbm_train": -12.2971,
+        "ens": -14.225
+      },
+      "diebold_mariano_test": {
+        "label": "descriptive, test",
+        "method": "absolute loss, HAC variance (Newey-West, Bartlett weights, h=24), Harvey-Leybourne-Newbold correction, Student t(n-1)",
+        "convention": "DM < 0 means the first model is more accurate",
+        "served_vs_lightgbm": {
+          "DM": 3.4486,
+          "p_value": 0.0006,
+          "n": 3624,
+          "better": "lgbm"
+        },
+        "served_vs_lear": {
+          "DM": -9.2521,
+          "p_value": 0.0,
+          "n": 3624,
+          "better": "served"
+        },
+        "ensemble_vs_lightgbm": {
+          "DM": 3.4486,
+          "p_value": 0.0006,
+          "n": 3624,
+          "better": "lgbm"
+        }
       },
       "interval_coverage_P10_P90": {
-        "target_pct": 80.0,
-        "bands": "LightGBM quantile models (P10, P25, P75, P90)",
-        "static_full_test_pct": 35.4,
-        "aci_full_test_pct": 78.3,
-        "static_and_aci_source": "evaluate_DK2_20260605.log, run of 2026-06-05 15:19:27",
-        "aci_method": "Adaptive conformal inference (Gibbs and Candes, 2021), target 0.80, gamma 0.03, updated online over the whole test window.",
         "split_conformal": {
-          "source": "evaluate_DK2_20260605.log, run of 2026-06-05 15:19:23",
-          "calibrated_on": "first half of the test window",
-          "measured_on_hours": 1812,
-          "P10_P90_raw_pct": 34.4,
-          "P10_P90_conformal_pct": 79.3,
-          "P25_P75_raw_pct": 19.9,
-          "P25_P75_conformal_pct": 48.6,
-          "P10_P90_width_raw_eur_mwh": 22.8,
-          "P10_P90_width_conformal_eur_mwh": 62.0
+          "calibrated_on": "validation quarter 2025-10-01 to 2025-12-31 23:00 (train.py)",
+          "measured_on": "whole test window, served bands",
+          "n_hours": 3624,
+          "P10_P90_before_conformal_pct": 49.1998,
+          "P10_P90_served_pct": 60.7616,
+          "P25_P75_before_conformal_pct": 26.7384,
+          "P25_P75_served_pct": 34.3543,
+          "P10_P90_width_before_conformal": 36.9331,
+          "P10_P90_width_served": 45.8974,
+          "quantiles_sorted_per_hour": true,
+          "hours_with_crossed_quantiles_before_conformal": 857,
+          "hours_with_crossed_quantiles_before_sorting": 442,
+          "hours_with_crossed_quantiles_served": 0,
+          "P10_P90_before_sorting_pct": 60.5132,
+          "P25_P75_before_sorting_pct": 34.3819,
+          "P10_P90_width_before_sorting": 45.6819,
+          "pinball_loss_before_sorting": 7.0989
+        },
+        "aci_daily": {
+          "coverage_static": 0.492,
+          "coverage_aci": 0.7928,
+          "target": 0.8,
+          "width_static_mean": 36.9331,
+          "width_aci_mean": 66.9345,
+          "k_final": 1.786,
+          "k_mean": 1.8137,
+          "gamma": 0.03,
+          "update": "daily",
+          "bands": "served P10-P90 before the conformal step",
+          "k0": 1.0,
+          "gamma_note": "fixed, not tuned"
         }
       },
       "probabilistic_scores": {
-        "source": "evaluate_DK2_20260605.log, run of 2026-06-05 15:19:26",
-        "pinball_loss_eur_mwh": 7.349,
-        "crps_approx_eur_mwh": 14.698,
-        "crps_note": "Approximated from 5 quantiles."
+        "pinball_loss": 7.0861,
+        "crps_approx": 14.1723,
+        "n_quantiles": 5,
+        "bands": "served (conformal)"
       },
       "battery_backtest": {
-        "source": "Recomputed on 2026-10-23 with the battery backtest call of src/model/evaluate.py (battery_arbitrage_backtest, method lp) on the local feature table and the evaluation models, after the fix that limits charge plus discharge to the power rating in every hour. It replaces the figures of evaluate_DK2 (June 2026), which lacked that limit.",
-        "setup": "1 MW / 2 MWh, round-trip efficiency 0.90, daily linear program (src/model/battery_backtest.py, method lp) with charge plus discharge at most 1 MW in every hour, settled at actual prices, annualised from the test window.",
-        "forecast_used": "Ensemble+AR_DA as computed by src/model/evaluate.py (diverse ensemble with day-ahead AR correction)",
-        "days": 149,
-        "profit_forecast_eur_per_year": 75867,
-        "profit_perfect_foresight_eur_per_year": 82349,
-        "share_of_perfect_foresight_pct": 92.1,
-        "profit_fixed_schedule_eur_per_year": 16955,
-        "uplift_vs_fixed_schedule_eur_per_year": 58912,
-        "fixed_schedule": "charge 00:00-02:00, discharge 17:00-19:00, Copenhagen time"
+        "setup": "1 MW / 2 MWh, round-trip efficiency 0.90, daily linear program (src/model/battery_backtest.py, method lp), settled at actual prices, annualised from the test window",
+        "served_forecast": {
+          "n_days": 149,
+          "method": "lp",
+          "capacity_mwh": 2.0,
+          "power_mw": 1.0,
+          "efficiency": 0.9,
+          "profit_perfect_total": 33616.3,
+          "profit_forecast_total": 31764.8,
+          "profit_naive_total": 6921.6,
+          "profit_perfect_annual": 82349.0,
+          "profit_forecast_annual": 77813.0,
+          "profit_naive_annual": 16955.0,
+          "pct_of_oracle_forecast": 94.5,
+          "pct_of_oracle_naive": 20.6,
+          "forecast_vs_naive_uplift_annual": 60858.0,
+          "forecast_used": "served"
+        },
+        "persistence_forecast": {
+          "profit_forecast_annual": 67344.0,
+          "pct_of_oracle_forecast": 81.8,
+          "n_days": 149
+        },
+        "served_minus_persistence_annual": 10469.0
       },
       "walk_forward_summary": {
-        "source": "evaluate_DK2_20260605.log, run of 2026-06-05 15:19:23; monthly folds in data/models/walkforward_DK2.csv",
+        "model": "LightGBM, 500 trees, expanding window, retrained monthly",
+        "note": "descriptive; not the served model and not used for any choice",
         "folds": 24,
         "first_month": "2024-06",
         "last_month": "2026-05",
         "MAE_monthly": {
-          "mean": 15.53,
-          "std": 2.88,
-          "min": 11.42,
-          "max": 21.37
-        },
-        "MAE_monthly_with_AR": {
-          "mean": 15.52,
-          "std": 2.94,
-          "min": 11.32,
-          "max": 21.73
+          "mean": 15.4969,
+          "std": 2.9516,
+          "min": 11.309,
+          "max": 20.826
         }
       },
       "test_window_prices": {
-        "source": "data/master/dataset_master.parquet, column price_DK2 (computed 2026-10-23; the master table is not published)",
-        "n_hours": 3624,
-        "mean_eur_mwh": 99.753,
-        "std_eur_mwh": 52.029
+        "mean": 99.753,
+        "std": 52.0289,
+        "n": 3624
+      },
+      "price_level_by_split": {
+        "source": "price_<zone> of data/master/dataset_features.parquet (step 14), split dates of src/model/config.py",
+        "train": {
+          "mean": 77.4955,
+          "std": 51.9117,
+          "n_hours": 24096
+        },
+        "validation": {
+          "mean": 85.8763,
+          "std": 47.9446,
+          "n_hours": 2208
+        },
+        "test": {
+          "mean": 99.753,
+          "std": 52.0289,
+          "n_hours": 3624
+        }
       }
     },
     "FI": {
       "served_model": {
-        "source": "data/metadata/served_metrics_FI.json (written by scripts/evaluate_fi_regimes.py on 2026-06-10)",
-        "production_model": "Diverse ensemble (L2+median+Huber) + AR",
+        "source": "data/metadata/served_metrics_FI.json (scripts/gen_served_metrics.py)",
+        "label": "Diverse ensemble (L2 + median + Huber)",
+        "served_model": "ensemble",
+        "use_ar": false,
         "n_hours": 3624,
-        "MAE": 21.05,
-        "RMSE": 37.625,
-        "DirAcc_pct": 72.95,
-        "R2": null,
-        "R2_note": "Not computed for the served FI ensemble. The single LightGBM in FI has R2 = 0.7075 (data/metadata/train_FI_20260606_091405.json), which is not the served model."
+        "MAE": 21.455,
+        "RMSE": 37.57,
+        "DirAcc_pct": 73.14,
+        "R2": 0.7173,
+        "mean_forecast_minus_actual": -10.379,
+        "MAE_pct_of_mean_price": 28.3,
+        "check_equals_evaluate_served_row": true
       },
       "served_model_vs_baselines": {
-        "source": "Derived from the served MAE above and results/baselines_test2026.json (MAE of persistence_24h and lear).",
+        "source": "served MAE above and results/baselines_test2026.json",
         "MAE_persistence_24h": 34.376,
         "MAE_lear": 28.697,
-        "rMAE_vs_persistence_24h": 0.612,
-        "MAE_change_vs_persistence_24h_pct": -38.8,
-        "MAE_change_vs_lear_pct": -26.6
+        "rMAE_vs_persistence_24h": 0.624,
+        "rMAE_vs_lear": 0.748,
+        "MAE_change_vs_persistence_24h_pct": -37.6,
+        "MAE_change_vs_lear_pct": -25.2
       },
-      "evaluation_run": {
-        "source": "evaluate_FI_20260606.log, last run in the file (started 2026-06-06 09:21:53). Earlier runs in the same log used an older test window and are not used.",
-        "features": 224,
-        "note": "Models as scored by src/model/evaluate.py on the earlier feature table. The served-model block above was measured later on the final table, so the numbers differ slightly. The baseline rows of this run are not copied: the run predates the fix of 2026-10-23, and in DK2 and FI its LEAR row was fitted on DK1 wind and temperature. Baselines are in results/baselines_test2026.json.",
-        "models": {
-          "LightGBM": {
-            "MAE": 25.853,
-            "RMSE": 38.213,
-            "sMAPE_pct": 51.16,
-            "DirAcc_pct": 65.5,
-            "R2": 0.7075
-          },
-          "LightGBM+AR_DA": {
-            "MAE": 26.032,
-            "RMSE": 38.472,
-            "sMAPE_pct": 51.7,
-            "DirAcc_pct": 65.8,
-            "R2": 0.7051
-          },
-          "Ensemble": {
-            "MAE": 21.302,
-            "RMSE": 38.221,
-            "sMAPE_pct": 41.08,
-            "DirAcc_pct": 73.0,
-            "R2": 0.7074
-          },
-          "Ensemble+AR_DA": {
-            "MAE": 19.275,
-            "RMSE": 36.265,
-            "sMAPE_pct": 34.59,
-            "DirAcc_pct": 72.0,
-            "R2": 0.738
-          }
+      "comparators_raw": {
+        "source": "results/evaluation_test2026_FI.json (src/model/evaluate.py)",
+        "note": "raw models without the AR term; LightGBM is the 2,000-tree model fitted on train plus validation, LightGBM_train the one fitted on train only (the selection candidate)",
+        "LightGBM": {
+          "n_obs": 3624.0,
+          "MAE": 26.491,
+          "RMSE": 39.59,
+          "sMAPE": 56.184,
+          "DirAcc": 64.78,
+          "R2": 0.686
         },
-        "lear_row_recomputed": {
-          "source": "src/model/evaluate.py (compute_all_metrics) re-run on 2026-10-23 on the local feature table, with LEARBaseline(alpha=0.1, zone=FI); identical to the lear row of results/baselines_test2026.json",
-          "MAE": 28.697,
-          "RMSE": 42.123,
-          "sMAPE_pct": 71.26,
-          "DirAcc_pct": 70.55,
-          "R2": 0.6446,
-          "MAE_before_fix_with_DK1_weather": 33.813
+        "LightGBM_train": {
+          "n_obs": 3624.0,
+          "MAE": 27.781,
+          "RMSE": 38.584,
+          "sMAPE": 52.728,
+          "DirAcc": 65.66,
+          "R2": 0.7018
+        },
+        "Ensemble": {
+          "n_obs": 3624.0,
+          "MAE": 21.455,
+          "RMSE": 37.57,
+          "sMAPE": 44.908,
+          "DirAcc": 73.14,
+          "R2": 0.7173
         }
       },
-      "diebold_mariano": {
-        "source": "evaluate_FI_20260606.log, run of 2026-06-06 09:22:00",
-        "comparison": "diverse ensemble vs single LightGBM, absolute loss, both without AR correction",
-        "DM": -8.71,
-        "p_value_as_logged": 0.0,
-        "p_value_note": "The log prints p with 3 decimals (0.000), so p < 0.001.",
-        "better_model": "ensemble"
+      "mean_forecast_minus_actual": {
+        "served": -10.3794,
+        "lgbm": -4.6162,
+        "lgbm_train": 8.5361,
+        "ens": -10.3794
+      },
+      "diebold_mariano_test": {
+        "label": "descriptive, test",
+        "method": "absolute loss, HAC variance (Newey-West, Bartlett weights, h=24), Harvey-Leybourne-Newbold correction, Student t(n-1)",
+        "convention": "DM < 0 means the first model is more accurate",
+        "served_vs_lightgbm": {
+          "DM": -3.1767,
+          "p_value": 0.0015,
+          "n": 3624,
+          "better": "served"
+        },
+        "served_vs_lear": {
+          "DM": -8.1836,
+          "p_value": 0.0,
+          "n": 3624,
+          "better": "served"
+        },
+        "ensemble_vs_lightgbm": {
+          "DM": -3.1767,
+          "p_value": 0.0015,
+          "n": 3624,
+          "better": "ens"
+        }
       },
       "interval_coverage_P10_P90": {
-        "target_pct": 80.0,
-        "bands": "LightGBM quantile models (P10, P25, P75, P90)",
-        "static_full_test_pct": 55.0,
-        "aci_full_test_pct": 78.0,
-        "static_and_aci_source": "evaluate_FI_20260606.log, run of 2026-06-06 09:22:00",
-        "aci_method": "Adaptive conformal inference (Gibbs and Candes, 2021), target 0.80, gamma 0.03, updated online over the whole test window.",
         "split_conformal": {
-          "source": "evaluate_FI_20260606.log, run of 2026-06-06 09:21:59",
-          "calibrated_on": "first half of the test window",
-          "measured_on_hours": 1812,
-          "P10_P90_raw_pct": 51.2,
-          "P10_P90_conformal_pct": 74.0,
-          "P25_P75_raw_pct": 20.1,
-          "P25_P75_conformal_pct": 40.6,
-          "P10_P90_width_raw_eur_mwh": 28.6,
-          "P10_P90_width_conformal_eur_mwh": 52.9
+          "calibrated_on": "validation quarter 2025-10-01 to 2025-12-31 23:00 (train.py)",
+          "measured_on": "whole test window, served bands",
+          "n_hours": 3624,
+          "P10_P90_before_conformal_pct": 78.2009,
+          "P10_P90_served_pct": 81.4845,
+          "P25_P75_before_conformal_pct": 44.8675,
+          "P25_P75_served_pct": 47.3786,
+          "P10_P90_width_before_conformal": 67.2304,
+          "P10_P90_width_served": 71.1001,
+          "quantiles_sorted_per_hour": true,
+          "hours_with_crossed_quantiles_before_conformal": 888,
+          "hours_with_crossed_quantiles_before_sorting": 755,
+          "hours_with_crossed_quantiles_served": 0,
+          "P10_P90_before_sorting_pct": 80.5188,
+          "P25_P75_before_sorting_pct": 47.1854,
+          "P10_P90_width_before_sorting": 70.7225,
+          "pinball_loss_before_sorting": 8.1012
+        },
+        "aci_daily": {
+          "coverage_static": 0.782,
+          "coverage_aci": 0.7958,
+          "target": 0.8,
+          "width_static_mean": 67.2304,
+          "width_aci_mean": 75.9021,
+          "k_final": 1.456,
+          "k_mean": 1.0755,
+          "gamma": 0.03,
+          "update": "daily",
+          "bands": "served P10-P90 before the conformal step",
+          "k0": 1.0,
+          "gamma_note": "fixed, not tuned"
         }
       },
       "probabilistic_scores": {
-        "source": "evaluate_FI_20260606.log, run of 2026-06-06 09:22:00",
-        "pinball_loss_eur_mwh": 8.283,
-        "crps_approx_eur_mwh": 16.567,
-        "crps_note": "Approximated from 5 quantiles."
+        "pinball_loss": 8.0704,
+        "crps_approx": 16.1407,
+        "n_quantiles": 5,
+        "bands": "served (conformal)"
       },
       "battery_backtest": {
-        "source": "Recomputed on 2026-10-23 with the battery backtest call of src/model/evaluate.py (battery_arbitrage_backtest, method lp) on the local feature table and the evaluation models, after the fix that limits charge plus discharge to the power rating in every hour. It replaces the figures of evaluate_FI (June 2026), which lacked that limit.",
-        "setup": "1 MW / 2 MWh, round-trip efficiency 0.90, daily linear program (src/model/battery_backtest.py, method lp) with charge plus discharge at most 1 MW in every hour, settled at actual prices, annualised from the test window.",
-        "forecast_used": "Ensemble+AR_DA as computed by src/model/evaluate.py (diverse ensemble with day-ahead AR correction)",
-        "days": 149,
-        "profit_forecast_eur_per_year": 40508,
-        "profit_perfect_foresight_eur_per_year": 54065,
-        "share_of_perfect_foresight_pct": 74.9,
-        "profit_fixed_schedule_eur_per_year": 22017,
-        "uplift_vs_fixed_schedule_eur_per_year": 18491,
-        "fixed_schedule": "charge 00:00-02:00, discharge 17:00-19:00, Copenhagen time"
+        "setup": "1 MW / 2 MWh, round-trip efficiency 0.90, daily linear program (src/model/battery_backtest.py, method lp), settled at actual prices, annualised from the test window",
+        "served_forecast": {
+          "n_days": 149,
+          "method": "lp",
+          "capacity_mwh": 2.0,
+          "power_mw": 1.0,
+          "efficiency": 0.9,
+          "profit_perfect_total": 22070.3,
+          "profit_forecast_total": 17207.2,
+          "profit_naive_total": 8987.9,
+          "profit_perfect_annual": 54065.0,
+          "profit_forecast_annual": 42152.0,
+          "profit_naive_annual": 22017.0,
+          "pct_of_oracle_forecast": 78.0,
+          "pct_of_oracle_naive": 40.7,
+          "forecast_vs_naive_uplift_annual": 20135.0,
+          "forecast_used": "served"
+        },
+        "persistence_forecast": {
+          "profit_forecast_annual": 31395.0,
+          "pct_of_oracle_forecast": 58.1,
+          "n_days": 149
+        },
+        "served_minus_persistence_annual": 10757.0
       },
       "walk_forward_summary": {
-        "source": "evaluate_FI_20260606.log, run of 2026-06-06 09:21:59; monthly folds in data/models/walkforward_FI.csv",
+        "model": "LightGBM, 500 trees, expanding window, retrained monthly",
+        "note": "descriptive; not the served model and not used for any choice",
         "folds": 24,
         "first_month": "2024-06",
         "last_month": "2026-05",
         "MAE_monthly": {
-          "mean": 22.0,
-          "std": 6.83,
-          "min": 9.54,
-          "max": 34.15
-        },
-        "MAE_monthly_with_AR": {
-          "mean": 21.71,
-          "std": 6.76,
-          "min": 9.32,
-          "max": 34.07
+          "mean": 22.4515,
+          "std": 6.9272,
+          "min": 9.928,
+          "max": 35.086
         }
       },
       "test_window_prices": {
-        "source": "data/master/dataset_master.parquet, column price_FI (computed 2026-10-23; the master table is not published)",
-        "n_hours": 3624,
-        "mean_eur_mwh": 75.918,
-        "std_eur_mwh": 70.665
+        "mean": 75.9184,
+        "std": 70.6653,
+        "n": 3624
+      },
+      "price_level_by_split": {
+        "source": "price_<zone> of data/master/dataset_features.parquet (step 14), split dates of src/model/config.py",
+        "train": {
+          "mean": 47.8015,
+          "std": 63.3982,
+          "n_hours": 24096
+        },
+        "validation": {
+          "mean": 44.3003,
+          "std": 49.6377,
+          "n_hours": 2208
+        },
+        "test": {
+          "mean": 75.9184,
+          "std": 70.6653,
+          "n_hours": 3624
+        }
       }
     }
-  }
+  },
+  "related_files": [
+    "results/fi_regimes_test2026.json",
+    "results/leakage_sensitivity_test2026.json"
+  ]
 }

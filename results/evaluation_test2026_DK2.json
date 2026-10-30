@@ -1,0 +1,264 @@
+{
+  "zone": "DK2",
+  "generated_by": "src/model/evaluate.py (evaluate_zone)",
+  "generated_on": "2026-10-30",
+  "method": "single run of the served forecast (predict_with_bands: model chosen on validation, day-ahead AR per delivery day if selected, conformal bands fitted on validation) over the whole test window; comparators, DM, coverage, pinball/CRPS and the battery backtest come from this same run",
+  "test_window_utc": {
+    "start": "2026-01-01",
+    "end": "2026-05-31 23:00"
+  },
+  "served_model": "ensemble",
+  "use_ar": false,
+  "served_label": "Diverse ensemble (L2 + median + Huber)",
+  "selection_note": "served model, AR term and conformal calibration were fixed on the validation quarter by src/model/train.py",
+  "metrics": {
+    "Served": {
+      "n_obs": 3624.0,
+      "MAE": 18.919,
+      "RMSE": 28.892,
+      "sMAPE": 30.092,
+      "DirAcc": 84.02,
+      "R2": 0.6916
+    },
+    "LightGBM": {
+      "n_obs": 3624.0,
+      "MAE": 17.964,
+      "RMSE": 27.024,
+      "sMAPE": 29.267,
+      "DirAcc": 81.84,
+      "R2": 0.7302
+    },
+    "LightGBM_train": {
+      "n_obs": 3624.0,
+      "MAE": 17.476,
+      "RMSE": 26.621,
+      "sMAPE": 29.393,
+      "DirAcc": 82.53,
+      "R2": 0.7381
+    },
+    "Ensemble": {
+      "n_obs": 3624.0,
+      "MAE": 18.919,
+      "RMSE": 28.892,
+      "sMAPE": 30.092,
+      "DirAcc": 84.02,
+      "R2": 0.6916
+    },
+    "Persistence_24h": {
+      "n_obs": 3624.0,
+      "MAE": 30.422,
+      "RMSE": 45.653,
+      "sMAPE": 45.084,
+      "DirAcc": 79.57,
+      "R2": 0.2299
+    },
+    "WeeklyMean_4w": {
+      "n_obs": 3624.0,
+      "MAE": 33.776,
+      "RMSE": 45.247,
+      "sMAPE": 44.785,
+      "DirAcc": 81.59,
+      "R2": 0.2435
+    },
+    "LEAR": {
+      "n_obs": 3624.0,
+      "MAE": 26.273,
+      "RMSE": 35.017,
+      "sMAPE": 39.603,
+      "DirAcc": 80.18,
+      "R2": 0.5469
+    }
+  },
+  "mean_forecast_minus_actual": {
+    "served": -14.225,
+    "lgbm": -13.1163,
+    "lgbm_train": -12.2971,
+    "ens": -14.225
+  },
+  "test_prices": {
+    "mean": 99.753,
+    "std": 52.0289,
+    "n": 3624
+  },
+  "error_stats": {
+    "hourly_mae": {
+      "0": 16.1283,
+      "1": 15.506,
+      "2": 15.1091,
+      "3": 14.5469,
+      "4": 14.6362,
+      "5": 14.411,
+      "6": 16.0969,
+      "7": 20.0803,
+      "8": 23.2285,
+      "9": 23.0177,
+      "10": 20.3289,
+      "11": 19.3474,
+      "12": 19.2129,
+      "13": 18.4359,
+      "14": 17.5199,
+      "15": 18.3603,
+      "16": 20.7797,
+      "17": 29.6045,
+      "18": 26.0099,
+      "19": 23.012,
+      "20": 21.5437,
+      "21": 17.4138,
+      "22": 15.5646,
+      "23": 14.1512
+    },
+    "season_mae": {
+      "Verano": 21.9451,
+      "Invierno": 21.5422,
+      "Primavera": 17.2339
+    },
+    "price_level_mae": {
+      "MAE": {
+        "Negativo (<0)": 6.9823,
+        "Bajo (0-20)": 12.9959,
+        "Normal (20-50)": 13.5051,
+        "Alto (50-100)": 14.8677,
+        "Pico (100-200)": 19.3038,
+        "Extremo (>200)": 104.1999
+      },
+      "n_obs": {
+        "Negativo (<0)": 71,
+        "Bajo (0-20)": 301,
+        "Normal (20-50)": 232,
+        "Alto (50-100)": 1032,
+        "Pico (100-200)": 1902,
+        "Extremo (>200)": 86
+      }
+    },
+    "wind_mae": {
+      "MAE": {
+        "Muy bajo (<Q1)": 16.7464,
+        "Bajo (Q1-Q2)": 20.2331,
+        "Alto (Q2-Q3)": 20.1492,
+        "Muy alto (>Q3)": 18.546
+      },
+      "n_obs": {
+        "Muy bajo (<Q1)": 906,
+        "Bajo (Q1-Q2)": 906,
+        "Alto (Q2-Q3)": 906,
+        "Muy alto (>Q3)": 906
+      }
+    },
+    "autocorr": {
+      "lag1": 0.8231,
+      "lag24": 0.2379
+    }
+  },
+  "economic": {
+    "industrial": {
+      "MW_flexible": 5.0,
+      "dias_simulados": 151,
+      "horas_simuladas": 3624,
+      "ahorro_modelo_test_EUR": 227931.0,
+      "ahorro_baseline_test_EUR": 190832.0,
+      "valor_incremental_test_EUR": 37099.0,
+      "valor_incremental_anual_EUR": 89676.0
+    },
+    "trader": {
+      "MWh_por_hora": 1.0,
+      "pnl_modelo_test_EUR": -18215.0,
+      "pnl_naive_test_EUR": 32624.0,
+      "valor_incremental_test_EUR": -50839.0,
+      "valor_incremental_anual_EUR": -122890.0
+    },
+    "ev_charging": {
+      "MW_carga": 2.0,
+      "ahorro_modelo_test_EUR": 54661.0,
+      "ahorro_baseline_test_EUR": 48179.0,
+      "valor_incremental_test_EUR": 6482.0,
+      "valor_incremental_anual_EUR": 15668.0
+    }
+  },
+  "conformal": {
+    "calibrated_on": "validation quarter 2025-10-01 to 2025-12-31 23:00 (train.py)",
+    "measured_on": "whole test window, served bands",
+    "n_hours": 3624,
+    "P10_P90_before_conformal_pct": 49.1998,
+    "P10_P90_served_pct": 60.7616,
+    "P25_P75_before_conformal_pct": 26.7384,
+    "P25_P75_served_pct": 34.3543,
+    "P10_P90_width_before_conformal": 36.9331,
+    "P10_P90_width_served": 45.8974,
+    "quantiles_sorted_per_hour": true,
+    "hours_with_crossed_quantiles_before_conformal": 857,
+    "hours_with_crossed_quantiles_before_sorting": 442,
+    "hours_with_crossed_quantiles_served": 0,
+    "P10_P90_before_sorting_pct": 60.5132,
+    "P25_P75_before_sorting_pct": 34.3819,
+    "P10_P90_width_before_sorting": 45.6819,
+    "pinball_loss_before_sorting": 7.0989
+  },
+  "advanced": {
+    "diebold_mariano": {
+      "label": "descriptive, test",
+      "method": "absolute loss, HAC variance (Newey-West, Bartlett weights, h=24), Harvey-Leybourne-Newbold correction, Student t(n-1)",
+      "convention": "DM < 0 means the first model is more accurate",
+      "served_vs_lightgbm": {
+        "DM": 3.4486,
+        "p_value": 0.0006,
+        "n": 3624,
+        "better": "lgbm"
+      },
+      "served_vs_lear": {
+        "DM": -9.2521,
+        "p_value": 0.0,
+        "n": 3624,
+        "better": "served"
+      },
+      "ensemble_vs_lightgbm": {
+        "DM": 3.4486,
+        "p_value": 0.0006,
+        "n": 3624,
+        "better": "lgbm"
+      }
+    },
+    "probabilistic": {
+      "pinball_loss": 7.0861,
+      "crps_approx": 14.1723,
+      "n_quantiles": 5,
+      "bands": "served (conformal, sorted per hour)"
+    },
+    "aci": {
+      "coverage_static": 0.492,
+      "coverage_aci": 0.7928,
+      "target": 0.8,
+      "width_static_mean": 36.9331,
+      "width_aci_mean": 66.9345,
+      "k_final": 1.786,
+      "k_mean": 1.8137,
+      "gamma": 0.03,
+      "update": "daily",
+      "bands": "served P10-P90 before the conformal step",
+      "k0": 1.0,
+      "gamma_note": "fixed, not tuned"
+    },
+    "battery": {
+      "n_days": 149,
+      "method": "lp",
+      "capacity_mwh": 2.0,
+      "power_mw": 1.0,
+      "efficiency": 0.9,
+      "profit_perfect_total": 33616.3,
+      "profit_forecast_total": 31764.8,
+      "profit_naive_total": 6921.6,
+      "profit_perfect_annual": 82349.0,
+      "profit_forecast_annual": 77813.0,
+      "profit_naive_annual": 16955.0,
+      "pct_of_oracle_forecast": 94.5,
+      "pct_of_oracle_naive": 20.6,
+      "forecast_vs_naive_uplift_annual": 60858.0,
+      "forecast_used": "served"
+    },
+    "battery_persistence_forecast": {
+      "profit_forecast_annual": 67344.0,
+      "pct_of_oracle_forecast": 81.8,
+      "n_days": 149
+    }
+  },
+  "walk_forward_mae_mean": 15.4969
+}
